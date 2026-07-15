@@ -2,6 +2,7 @@
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
 $ErrorActionPreference = 'Stop'
 
@@ -21,7 +22,7 @@ $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '0.18.0'
+$script:Version = '0.19.0'
 
 trap {
     $details = ($_ | Out-String)
@@ -127,6 +128,8 @@ $script:DesktopHandle = [IntPtr]::Zero
 $script:WidgetHandle = [IntPtr]::Zero
 $script:BottomEnforcementTimer = $null
 $script:ScreenCheckTimer = $null
+$script:TrayIcon = $null
+$script:TrayMenu = $null
 $script:IsRestoringUiState = $false
 $script:ExportType = 'completed'
 $script:ExportStartDate = $null
@@ -531,6 +534,52 @@ function Start-ScreenMonitoring {
         $script:ScreenCheckTimer.Add_Tick({ Ensure-WidgetOnVisibleScreen })
     }
     if (-not $script:ScreenCheckTimer.IsEnabled) { $script:ScreenCheckTimer.Start() }
+}
+
+function Move-WidgetToPrimaryScreen {
+    if ($script:WidgetHandle -eq [IntPtr]::Zero) { return }
+    $primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
+    if ($null -eq $primaryScreen) { return }
+
+    $windowRect = New-Object DesktopWidgetNative+RECT
+    if (-not [DesktopWidgetNative]::GetWindowRect($script:WidgetHandle, [ref]$windowRect)) { return }
+    $workingArea = $primaryScreen.WorkingArea
+    $windowWidth = [Math]::Max(1, $windowRect.Right - $windowRect.Left)
+    $windowHeight = [Math]::Max(1, $windowRect.Bottom - $windowRect.Top)
+    $newLeft = [int]($workingArea.Left + [Math]::Max(0, ($workingArea.Width - $windowWidth) / 2))
+    $newTop = [int]($workingArea.Top + [Math]::Max(0, ($workingArea.Height - $windowHeight) / 2))
+
+    [void][DesktopWidgetNative]::SetWindowPos($script:WidgetHandle, [IntPtr]::Zero, $newLeft, $newTop, 0, 0, 0x0015)
+    Send-WidgetToDesktopBottom
+    Save-State
+}
+
+function Show-WidgetFromTray {
+    if ($window.WindowState -eq [Windows.WindowState]::Minimized) { $window.WindowState = [Windows.WindowState]::Normal }
+    if (-not $window.IsVisible) { $window.Show() }
+    Move-WidgetToPrimaryScreen
+    [void]$window.Activate()
+}
+
+function Initialize-TrayIcon {
+    if ($null -ne $script:TrayIcon) { return }
+
+    $script:TrayMenu = [System.Windows.Forms.ContextMenuStrip]::new()
+    $locateItem = $script:TrayMenu.Items.Add('定位待办窗口')
+    $settingsItem = $script:TrayMenu.Items.Add('打开待办设置')
+    [void]$script:TrayMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
+    $exitItem = $script:TrayMenu.Items.Add('退出桌面待办')
+
+    $locateItem.Add_Click({ Show-WidgetFromTray })
+    $settingsItem.Add_Click({ Show-Settings })
+    $exitItem.Add_Click({ $window.Close() })
+
+    $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
+    $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Application
+    $script:TrayIcon.Text = "$($script:DisplayTitle) · 桌面待办 v$script:Version"
+    $script:TrayIcon.ContextMenuStrip = $script:TrayMenu
+    $script:TrayIcon.Add_DoubleClick({ Show-WidgetFromTray })
+    $script:TrayIcon.Visible = $true
 }
 
 function Load-State {
@@ -1114,6 +1163,7 @@ function Show-Settings {
         $script:AutoStartEnabled = $requestedAutoStart
         $script:DisplayTitle = $requestedTitle
         $titleText.Text = $script:DisplayTitle
+        if ($null -ne $script:TrayIcon) { $script:TrayIcon.Text = "$($script:DisplayTitle) · 桌面待办 v$script:Version" }
         Save-State
         Refresh-Tasks
         Apply-WindowLayerMode
@@ -1825,6 +1875,7 @@ $window.Add_ContentRendered({
     Apply-WindowLayerMode
     Ensure-WidgetOnVisibleScreen
     Start-ScreenMonitoring
+    Initialize-TrayIcon
 })
 $window.Add_Closing({
     if ($null -ne $script:BottomEnforcementTimer) { $script:BottomEnforcementTimer.Stop() }
@@ -1833,6 +1884,15 @@ $window.Add_Closing({
         Save-State
     }
     finally {
+        if ($null -ne $script:TrayIcon) {
+            $script:TrayIcon.Visible = $false
+            $script:TrayIcon.Dispose()
+            $script:TrayIcon = $null
+        }
+        if ($null -ne $script:TrayMenu) {
+            $script:TrayMenu.Dispose()
+            $script:TrayMenu = $null
+        }
         if ($null -ne $script:InstanceMutex) {
             try { $script:InstanceMutex.ReleaseMutex() } catch {}
             $script:InstanceMutex.Dispose()
