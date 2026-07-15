@@ -1,0 +1,14 @@
+# Personal todo data and generated exports
+detail/
+backup/
+output/
+
+# Local QA and dependencies
+.qa/
+node_modules/
+
+# Machine-specific files
+*.lnk
+*.log
+desktop.ini
+Thumbs.db
