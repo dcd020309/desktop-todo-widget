@@ -1,6 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
 
 $ErrorActionPreference = 'Stop'
 
@@ -20,7 +21,7 @@ $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '0.17.0'
+$script:Version = '0.18.0'
 
 trap {
     $details = ($_ | Out-String)
@@ -125,6 +126,7 @@ $script:DisplayTitle = '我的一天'
 $script:DesktopHandle = [IntPtr]::Zero
 $script:WidgetHandle = [IntPtr]::Zero
 $script:BottomEnforcementTimer = $null
+$script:ScreenCheckTimer = $null
 $script:IsRestoringUiState = $false
 $script:ExportType = 'completed'
 $script:ExportStartDate = $null
@@ -480,6 +482,55 @@ function Apply-WindowLayerMode {
         }
         $script:BottomEnforcementTimer.Start()
     }
+}
+
+function Ensure-WidgetOnVisibleScreen {
+    if ($script:WidgetHandle -eq [IntPtr]::Zero -or $null -eq $window) { return }
+
+    $windowRect = New-Object DesktopWidgetNative+RECT
+    if (-not [DesktopWidgetNative]::GetWindowRect($script:WidgetHandle, [ref]$windowRect)) { return }
+
+    $hasUsableIntersection = $false
+    foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+        $bounds = $screen.Bounds
+        $intersectionWidth = [Math]::Min($windowRect.Right, $bounds.Right) - [Math]::Max($windowRect.Left, $bounds.Left)
+        $intersectionHeight = [Math]::Min($windowRect.Bottom, $bounds.Bottom) - [Math]::Max($windowRect.Top, $bounds.Top)
+        if ($intersectionWidth -ge 80 -and $intersectionHeight -ge 60) {
+            $hasUsableIntersection = $true
+            break
+        }
+    }
+    if ($hasUsableIntersection) { return }
+
+    $primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
+    if ($null -eq $primaryScreen) { return }
+    $workingArea = $primaryScreen.WorkingArea
+    $windowWidth = [Math]::Max(1, $windowRect.Right - $windowRect.Left)
+    $windowHeight = [Math]::Max(1, $windowRect.Bottom - $windowRect.Top)
+    $newLeft = [int]($workingArea.Left + [Math]::Max(0, ($workingArea.Width - $windowWidth) / 2))
+    $newTop = [int]($workingArea.Top + [Math]::Max(0, ($workingArea.Height - $windowHeight) / 2))
+
+    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    [void][DesktopWidgetNative]::SetWindowPos(
+        $script:WidgetHandle,
+        [IntPtr]::Zero,
+        $newLeft,
+        $newTop,
+        0,
+        0,
+        0x0015
+    )
+    Send-WidgetToDesktopBottom
+    Save-State
+}
+
+function Start-ScreenMonitoring {
+    if ($null -eq $script:ScreenCheckTimer) {
+        $script:ScreenCheckTimer = [Windows.Threading.DispatcherTimer]::new()
+        $script:ScreenCheckTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $script:ScreenCheckTimer.Add_Tick({ Ensure-WidgetOnVisibleScreen })
+    }
+    if (-not $script:ScreenCheckTimer.IsEnabled) { $script:ScreenCheckTimer.Start() }
 }
 
 function Load-State {
@@ -1772,9 +1823,12 @@ $window.Add_Activated({
 $window.Add_ContentRendered({
     $newTaskText.Focus() | Out-Null
     Apply-WindowLayerMode
+    Ensure-WidgetOnVisibleScreen
+    Start-ScreenMonitoring
 })
 $window.Add_Closing({
     if ($null -ne $script:BottomEnforcementTimer) { $script:BottomEnforcementTimer.Stop() }
+    if ($null -ne $script:ScreenCheckTimer) { $script:ScreenCheckTimer.Stop() }
     try {
         Save-State
     }
