@@ -18,11 +18,12 @@ if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
 $script:AppDirectory = Join-Path $env:LOCALAPPDATA 'DesktopTodoDemo'
 $script:StatePath = Join-Path $script:AppDirectory 'state.json'
 $script:LauncherPath = Join-Path $PSScriptRoot 'Start-Todo.vbs'
+$script:IconPath = Join-Path $PSScriptRoot 'assets\todo-icon.ico'
 $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '0.19.0'
+$script:Version = '0.20.0'
 
 trap {
     $details = ($_ | Out-String)
@@ -130,6 +131,7 @@ $script:BottomEnforcementTimer = $null
 $script:ScreenCheckTimer = $null
 $script:TrayIcon = $null
 $script:TrayMenu = $null
+$script:AppIcon = $null
 $script:IsRestoringUiState = $false
 $script:ExportType = 'completed'
 $script:ExportStartDate = $null
@@ -575,7 +577,12 @@ function Initialize-TrayIcon {
     $exitItem.Add_Click({ $window.Close() })
 
     $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
-    $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Application
+    if (Test-Path -LiteralPath $script:IconPath) {
+        $script:AppIcon = [System.Drawing.Icon]::new($script:IconPath)
+        $script:TrayIcon.Icon = $script:AppIcon
+    } else {
+        $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Application
+    }
     $script:TrayIcon.Text = "$($script:DisplayTitle) · 桌面待办 v$script:Version"
     $script:TrayIcon.ContextMenuStrip = $script:TrayMenu
     $script:TrayIcon.Add_DoubleClick({ Show-WidgetFromTray })
@@ -822,6 +829,9 @@ function Save-UiStateIfReady {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $window.Title = "桌面待办 v$script:Version"
+if (Test-Path -LiteralPath $script:IconPath) {
+    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($script:IconPath, [UriKind]::Absolute))
+}
 
 $taskList = $window.FindName('TaskList')
 $newTaskText = $window.FindName('NewTaskText')
@@ -1888,6 +1898,10 @@ $window.Add_Closing({
             $script:TrayIcon.Visible = $false
             $script:TrayIcon.Dispose()
             $script:TrayIcon = $null
+        }
+        if ($null -ne $script:AppIcon) {
+            $script:AppIcon.Dispose()
+            $script:AppIcon = $null
         }
         if ($null -ne $script:TrayMenu) {
             $script:TrayMenu.Dispose()
