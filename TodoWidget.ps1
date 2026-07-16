@@ -24,7 +24,7 @@ $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '1.3.1'
+$script:Version = '1.3.3'
 
 trap {
     $details = ($_ | Out-String)
@@ -318,11 +318,27 @@ function Update-LocalDetailMetadata {
     }
 }
 
+function ConvertTo-PlainDetailContent {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $null }
+
+    # 1.3.1 及更早版本通过 Get-Content 读取 TXT。Windows PowerShell 会给返回的
+    # 字符串附加 PSPath、PSDrive、PSProvider 等扩展属性；ConvertTo-Json 随后可能
+    # 将这些元数据递归展开成几十 MB。旧快照中的正文保存在 value 属性中。
+    $rawText = if ($Value -isnot [string] -and $Value.PSObject.Properties.Name -contains 'value') {
+        [string]$Value.value
+    } else {
+        [string]$Value
+    }
+    return [string]::new($rawText.ToCharArray())
+}
+
 function New-TaskSyncRecord {
     param($Task)
     $detailPath = Resolve-TaskDetailPath ([string]$Task.id)
     $hasDetailFile = $null -ne $detailPath -and (Test-Path -LiteralPath $detailPath)
-    $detailContent = if ($hasDetailFile) { Get-Content -LiteralPath $detailPath -Raw -Encoding UTF8 } else { $null }
+    # File.ReadAllText 返回不带 PowerShell 文件系统扩展属性的纯字符串。
+    $detailContent = if ($hasDetailFile) { [IO.File]::ReadAllText($detailPath, [Text.Encoding]::UTF8) } else { $null }
     return [PSCustomObject]@{
         id = [string]$Task.id
         text = [string]$Task.text
@@ -484,7 +500,8 @@ function Invoke-ManualOneDriveSync {
             continue
         }
         New-Item -ItemType Directory -Path $script:DetailDirectory -Force | Out-Null
-        $detailContent = if ($null -eq $detailWinner.Record.detailContent) { '' } else { [string]$detailWinner.Record.detailContent }
+        $detailContent = ConvertTo-PlainDetailContent $detailWinner.Record.detailContent
+        if ($null -eq $detailContent) { $detailContent = '' }
         Set-Content -LiteralPath $detailPath -Value $detailContent -Encoding UTF8 -NoNewline
         $detailTime = [DateTimeOffset]::MinValue
         if ([DateTimeOffset]::TryParse($detailWinner.Timestamp, [ref]$detailTime)) {
@@ -509,7 +526,7 @@ function Invoke-ManualOneDriveSync {
     $outputSnapshot = New-DeviceSyncSnapshot
     $snapshotPath = Join-Path $devicesDirectory "$script:DeviceId.json"
     $temporarySnapshotPath = Join-Path $devicesDirectory ".$script:DeviceId.tmp"
-    $outputSnapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporarySnapshotPath -Encoding UTF8
+    $outputSnapshot | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $temporarySnapshotPath -Encoding UTF8
     Move-Item -LiteralPath $temporarySnapshotPath -Destination $snapshotPath -Force
 
     $script:SyncDirectory = $resolvedSyncDirectory
