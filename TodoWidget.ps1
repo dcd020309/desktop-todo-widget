@@ -24,7 +24,7 @@ $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '1.0.0'
+$script:Version = '1.3.1'
 
 trap {
     $details = ($_ | Out-String)
@@ -166,6 +166,7 @@ $script:ExportType = 'completed'
 $script:ExportStartDate = $null
 $script:ExportEndDate = $null
 $script:DropTargetCard = $null
+$script:DropGapKey = $null
 
 function New-TaskId {
     return [Guid]::NewGuid().ToString('N')
@@ -612,6 +613,25 @@ function Open-TaskDetail {
     }
 }
 
+function Remove-TaskDetail {
+    param([string]$TaskId)
+    $task = Get-TaskById $TaskId
+    if ($null -eq $task) { return $false }
+
+    $detailPath = Resolve-TaskDetailPath $TaskId
+    if ($null -eq $detailPath -or -not (Test-Path -LiteralPath $detailPath)) { return $false }
+
+    Remove-Item -LiteralPath $detailPath -Force -ErrorAction Stop
+    $deletionTimestamp = Get-UtcTimestamp
+    Set-ObjectProperty $task 'detailUpdatedAt' $deletionTimestamp
+    Set-ObjectProperty $task 'detailUpdatedBy' $script:DeviceId
+    Set-ObjectProperty $task 'detailDeleted' $true
+    Set-TaskModified $task $deletionTimestamp
+    Save-State
+    Refresh-Tasks
+    return $true
+}
+
 function Backup-AndRemoveTasks {
     param([bool]$Completed)
 
@@ -794,6 +814,78 @@ function Animate-CardScale {
     $scale.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $yAnimation)
 }
 
+function Animate-CardTranslateY {
+    param($Card, [double]$To, [int]$Milliseconds)
+    if ($null -eq $Card -or $null -eq $Card.RenderTransform -or $Card.RenderTransform.Children.Count -lt 2) { return }
+    $translate = $Card.RenderTransform.Children[1]
+    $animation = [Windows.Media.Animation.DoubleAnimation]::new()
+    $animation.To = $To
+    $animation.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds($Milliseconds))
+    $animation.EasingFunction = New-CardAnimationEase
+    $translate.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $animation)
+}
+
+function Reset-TaskDropGapAnimation {
+    if ($null -eq $script:DropGapKey) { return }
+    foreach ($child in $taskList.Children) {
+        if ($child -is [Windows.Controls.Border]) {
+            Animate-CardTranslateY $child 0 120
+        }
+    }
+    $script:DropGapKey = $null
+}
+
+function Update-TaskDropGapAnimation {
+    param([string]$SourceTaskId, $DropLocation)
+    if ($null -eq $DropLocation -or [string]$DropLocation.TargetId -eq $SourceTaskId) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $gapKey = "$([string]$DropLocation.TargetId)|$([bool]$DropLocation.PlaceAfter)"
+    if ($script:DropGapKey -eq $gapKey) { return }
+    $script:DropGapKey = $gapKey
+
+    $sourceTask = Get-TaskById $SourceTaskId
+    $sourceLevel = Get-TaskReorderLevel $sourceTask
+    if ($null -eq $sourceLevel) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $validCards = [Collections.Generic.List[object]]::new()
+    foreach ($child in $taskList.Children) {
+        if ($child -isnot [Windows.Controls.Border] -or [string]$child.Tag -eq $SourceTaskId) { continue }
+        $candidateTask = Get-TaskById ([string]$child.Tag)
+        if ((Get-TaskReorderLevel $candidateTask) -eq $sourceLevel) {
+            $validCards.Add($child)
+        }
+    }
+
+    $targetIndex = -1
+    for ($index = 0; $index -lt $validCards.Count; $index++) {
+        if ([string]$validCards[$index].Tag -eq [string]$DropLocation.TargetId) {
+            $targetIndex = $index
+            break
+        }
+    }
+    if ($targetIndex -lt 0) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $beforeIndex = if ([bool]$DropLocation.PlaceAfter) { $targetIndex } else { $targetIndex - 1 }
+    $afterIndex = if ([bool]$DropLocation.PlaceAfter) { $targetIndex + 1 } else { $targetIndex }
+    $beforeCard = if ($beforeIndex -ge 0 -and $beforeIndex -lt $validCards.Count) { $validCards[$beforeIndex] } else { $null }
+    $afterCard = if ($afterIndex -ge 0 -and $afterIndex -lt $validCards.Count) { $validCards[$afterIndex] } else { $null }
+
+    foreach ($child in $taskList.Children) {
+        if ($child -isnot [Windows.Controls.Border] -or [string]$child.Tag -eq $SourceTaskId) { continue }
+        $offset = if ($child -eq $beforeCard) { -9 } elseif ($child -eq $afterCard) { 9 } else { 0 }
+        Animate-CardTranslateY $child $offset 135
+    }
+}
+
 function Animate-CardEntry {
     param($Card)
     if ($null -eq $Card -or $Card.RenderTransform.Children.Count -lt 2) { return }
@@ -830,6 +922,10 @@ function Get-TaskDropLocation {
 
     foreach ($card in $validCards) {
         $top = $card.TranslatePoint([Windows.Point]::new(0, 0), $taskList).Y
+        if ($null -ne $card.RenderTransform -and $card.RenderTransform.Children.Count -ge 2) {
+            # RenderTransform 会参与 TranslatePoint；减去动画位移后，命中判断始终基于原始布局，避免让位动画造成边界抖动。
+            $top -= [double]$card.RenderTransform.Children[1].Y
+        }
         $bottom = $top + $card.ActualHeight
         if ($PointerY -lt $top) {
             return [PSCustomObject]@{ Card = $card; TargetId = [string]$card.Tag; PlaceAfter = $false }
@@ -1229,6 +1325,20 @@ function Save-UiStateIfReady {
     }
 }
 
+function Disable-ButtonFocusVisuals {
+    param($Root)
+    if ($null -eq $Root) { return }
+    if ($Root -is [Windows.Controls.Button]) {
+        $Root.FocusVisualStyle = $null
+    }
+    if ($Root -isnot [Windows.DependencyObject]) { return }
+    foreach ($child in [Windows.LogicalTreeHelper]::GetChildren($Root)) {
+        if ($child -is [Windows.DependencyObject]) {
+            Disable-ButtonFocusVisuals $child
+        }
+    }
+}
+
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -1241,6 +1351,7 @@ function Save-UiStateIfReady {
         <SolidColorBrush x:Key="Muted" Color="#FF8B909B"/>
         <SolidColorBrush x:Key="Accent" Color="#FF6C5CE7"/>
         <Style TargetType="Button">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontFamily" Value="Microsoft YaHei UI"/>
@@ -1248,6 +1359,7 @@ function Save-UiStateIfReady {
             <Setter Property="ToolTipService.ShowDuration" Value="6000"/>
         </Style>
         <Style x:Key="FilterButton" TargetType="Button">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="Foreground" Value="#FF8B909B"/>
             <Setter Property="FontSize" Value="12"/>
@@ -1362,6 +1474,7 @@ function Save-UiStateIfReady {
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+Disable-ButtonFocusVisuals $window
 $window.Title = "桌面待办 v$script:Version"
 if (Test-Path -LiteralPath $script:IconPath) {
     $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($script:IconPath, [UriKind]::Absolute))
@@ -1458,6 +1571,7 @@ function Show-PrerequisiteEditor {
 '@
     $editorReader = New-Object System.Xml.XmlNodeReader $editorXaml
     $editorWindow = [Windows.Markup.XamlReader]::Load($editorReader)
+    Disable-ButtonFocusVisuals $editorWindow
     $editorWindow.Owner = $window
     $editorWindow.FindName('TaskNameText').Text = "待办：$([string]$targetTask.text)"
     $editorComboBox = $editorWindow.FindName('EditorComboBox')
@@ -1503,6 +1617,108 @@ function Show-PrerequisiteEditor {
     Apply-WindowLayerMode
 }
 
+function Show-TaskTextEditor {
+    param([string]$TaskId)
+    $targetTask = Get-TaskById $TaskId
+    if ($null -eq $targetTask) { return }
+
+    [xml]$textEditorXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="修改待办文字" Width="400" Height="230"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        WindowStyle="ToolWindow" ShowInTaskbar="False"
+        Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
+    <Grid Margin="24,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Text="修改待办文字" FontSize="19" FontWeight="SemiBold" Foreground="#FF20242C"/>
+        <TextBox x:Name="TaskTextEditor" Grid.Row="1" Height="34" Margin="0,16,0,0"
+                 Padding="9,0" FontSize="13" VerticalContentAlignment="Center"/>
+        <TextBlock x:Name="TextEditorValidation" Grid.Row="2" Margin="0,10,0,0"
+                   FontSize="11" Foreground="#FFE05252" TextWrapping="Wrap"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="CancelTextEditorButton" Content="取消" Width="72" Height="32" Margin="0,0,10,0"/>
+            <Button x:Name="SaveTextEditorButton" Content="保存" Width="72" Height="32"
+                    Background="#FF6C5CE7" Foreground="White" BorderThickness="0"/>
+        </StackPanel>
+    </Grid>
+</Window>
+'@
+    $textEditorReader = New-Object System.Xml.XmlNodeReader $textEditorXaml
+    $textEditorWindow = [Windows.Markup.XamlReader]::Load($textEditorReader)
+    Disable-ButtonFocusVisuals $textEditorWindow
+    $textEditorWindow.Owner = $window
+    $taskTextEditor = $textEditorWindow.FindName('TaskTextEditor')
+    $textEditorValidation = $textEditorWindow.FindName('TextEditorValidation')
+    $saveTextEditorButton = $textEditorWindow.FindName('SaveTextEditorButton')
+    $cancelTextEditorButton = $textEditorWindow.FindName('CancelTextEditorButton')
+    $taskTextEditor.Text = [string]$targetTask.text
+    $taskTextEditor.SelectAll()
+
+    $saveTaskText = {
+        $newText = $taskTextEditor.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($newText)) {
+            $textEditorValidation.Text = '待办文字不能为空。'
+            $taskTextEditor.Focus() | Out-Null
+            return
+        }
+
+        $taskToUpdate = Get-TaskById $TaskId
+        if ($null -eq $taskToUpdate) {
+            $textEditorValidation.Text = '该待办已不存在，无法保存。'
+            return
+        }
+        if ($newText -eq [string]$taskToUpdate.text) {
+            $textEditorWindow.DialogResult = $true
+            return
+        }
+
+        $oldText = [string]$taskToUpdate.text
+        $oldDetailPath = Resolve-TaskDetailPath $TaskId
+        $hasDetail = $null -ne $oldDetailPath -and (Test-Path -LiteralPath $oldDetailPath)
+        $taskToUpdate.text = $newText
+        $newDetailPath = Get-TaskDetailPath $TaskId
+
+        try {
+            if ($hasDetail -and $oldDetailPath -ne $newDetailPath) {
+                if (Test-Path -LiteralPath $newDetailPath) {
+                    throw "新的详细说明文件名已存在，请先处理：$newDetailPath"
+                }
+                Move-Item -LiteralPath $oldDetailPath -Destination $newDetailPath -ErrorAction Stop
+            }
+            Set-TaskModified $taskToUpdate $null
+            Save-State
+            Refresh-Tasks
+            $textEditorWindow.DialogResult = $true
+        }
+        catch {
+            $taskToUpdate.text = $oldText
+            if ($hasDetail -and $oldDetailPath -ne $newDetailPath -and
+                -not (Test-Path -LiteralPath $oldDetailPath) -and (Test-Path -LiteralPath $newDetailPath)) {
+                try { Move-Item -LiteralPath $newDetailPath -Destination $oldDetailPath -ErrorAction Stop } catch {}
+            }
+            $textEditorValidation.Text = "无法保存修改：$($_.Exception.Message)"
+        }
+    }
+
+    $saveTextEditorButton.Add_Click($saveTaskText)
+    $taskTextEditor.Add_KeyDown({
+        if ($_.Key -eq [Windows.Input.Key]::Enter) {
+            & $saveTaskText
+            $_.Handled = $true
+        }
+    })
+    $cancelTextEditorButton.Add_Click({ $textEditorWindow.Close() })
+    $textEditorWindow.Add_ContentRendered({ $taskTextEditor.Focus() | Out-Null })
+    [void]$textEditorWindow.ShowDialog()
+    Apply-WindowLayerMode
+}
+
 function Show-TaskActions {
     param([string]$TaskId)
     $targetTask = Get-TaskById $TaskId
@@ -1511,7 +1727,7 @@ function Show-TaskActions {
     [xml]$actionsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="管理待办" Width="360" Height="300"
+        Title="管理待办" Width="360" Height="392"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
         WindowStyle="ToolWindow" ShowInTaskbar="False"
         Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
@@ -1525,8 +1741,10 @@ function Show-TaskActions {
         <TextBlock Text="管理待办" FontSize="19" FontWeight="SemiBold" Foreground="#FF20242C"/>
         <TextBlock x:Name="ActionTaskName" Grid.Row="1" Margin="0,10,0,16" FontSize="12" Foreground="#FF707580" TextWrapping="Wrap"/>
         <StackPanel Grid.Row="2">
+            <Button x:Name="EditTaskTextButton" Content="修改待办文字" Height="36" Margin="0,0,0,10" Background="#FFF0EEFC" Foreground="#FF6257C5" BorderThickness="0"/>
             <Button x:Name="EditPrerequisiteButton" Content="修改或取消前置任务" Height="36" Margin="0,0,0,10" Background="#FFECE9FF" Foreground="#FF5A49DA" BorderThickness="0"/>
             <Button x:Name="EditDetailButton" Content="编辑详细说明" Height="36" Margin="0,0,0,10" Background="#FFEDF4FF" Foreground="#FF376CA8" BorderThickness="0"/>
+            <Button x:Name="DeleteDetailButton" Content="删除详细说明" Height="36" Margin="0,0,0,10" Background="#FFFFF3E8" Foreground="#FFB46B29" BorderThickness="0"/>
             <Button x:Name="DeleteTaskButton" Content="删除待办" Height="36" Background="#FFFFECEC" Foreground="#FFC94B4B" BorderThickness="0"/>
         </StackPanel>
         <Button x:Name="CloseActionsButton" Grid.Row="3" Content="关闭" Width="72" Height="30" Margin="0,14,0,0" HorizontalAlignment="Right"/>
@@ -1535,13 +1753,26 @@ function Show-TaskActions {
 '@
     $actionsReader = New-Object System.Xml.XmlNodeReader $actionsXaml
     $actionsWindow = [Windows.Markup.XamlReader]::Load($actionsReader)
+    Disable-ButtonFocusVisuals $actionsWindow
     $actionsWindow.Owner = $window
     $actionsWindow.FindName('ActionTaskName').Text = [string]$targetTask.text
+    $editTaskTextButton = $actionsWindow.FindName('EditTaskTextButton')
     $editPrerequisiteButton = $actionsWindow.FindName('EditPrerequisiteButton')
     $editDetailButton = $actionsWindow.FindName('EditDetailButton')
+    $deleteDetailButton = $actionsWindow.FindName('DeleteDetailButton')
     $deleteTaskButton = $actionsWindow.FindName('DeleteTaskButton')
     $closeActionsButton = $actionsWindow.FindName('CloseActionsButton')
+    $existingDetailPath = Resolve-TaskDetailPath $TaskId
+    $deleteDetailButton.IsEnabled = $null -ne $existingDetailPath -and (Test-Path -LiteralPath $existingDetailPath)
+    if (-not $deleteDetailButton.IsEnabled) {
+        $deleteDetailButton.Content = '暂无详细说明可删除'
+        $deleteDetailButton.Opacity = 0.58
+    }
 
+    $editTaskTextButton.Add_Click({
+        $actionsWindow.Close()
+        Show-TaskTextEditor $TaskId
+    })
     $editPrerequisiteButton.Add_Click({
         $actionsWindow.Close()
         Show-PrerequisiteEditor $TaskId
@@ -1549,6 +1780,39 @@ function Show-TaskActions {
     $editDetailButton.Add_Click({
         $actionsWindow.Close()
         Open-TaskDetail $TaskId
+    })
+    $deleteDetailButton.Add_Click({
+        $currentTask = Get-TaskById $TaskId
+        if ($null -eq $currentTask) {
+            $actionsWindow.Close()
+            return
+        }
+        $answer = [Windows.MessageBox]::Show(
+            $actionsWindow,
+            "确定删除「$([string]$currentTask.text)」的详细说明吗？`n`n删除会在下次手动同步时应用到其他电脑。",
+            '删除详细说明',
+            [Windows.MessageBoxButton]::YesNo,
+            [Windows.MessageBoxImage]::Warning
+        )
+        if ($answer -ne [Windows.MessageBoxResult]::Yes) { return }
+        try {
+            if (Remove-TaskDetail $TaskId) {
+                $actionsWindow.Close()
+            } else {
+                $deleteDetailButton.IsEnabled = $false
+                $deleteDetailButton.Content = '暂无详细说明可删除'
+                $deleteDetailButton.Opacity = 0.58
+            }
+        }
+        catch {
+            [void][Windows.MessageBox]::Show(
+                $actionsWindow,
+                "无法删除详细说明：`n$($_.Exception.Message)",
+                '删除详细说明',
+                [Windows.MessageBoxButton]::OK,
+                [Windows.MessageBoxImage]::Error
+            )
+        }
     })
     $deleteTaskButton.Add_Click({
         $answer = [Windows.MessageBox]::Show(
@@ -1646,6 +1910,7 @@ function Show-Settings {
 '@
     $settingsReader = New-Object System.Xml.XmlNodeReader $settingsXaml
     $settingsWindow = [Windows.Markup.XamlReader]::Load($settingsReader)
+    Disable-ButtonFocusVisuals $settingsWindow
     $settingsWindow.Owner = $window
     $settingsWindow.MaxHeight = [Math]::Max(520, [Windows.SystemParameters]::WorkArea.Height - 40)
     if ($settingsWindow.Height -gt $settingsWindow.MaxHeight) { $settingsWindow.Height = $settingsWindow.MaxHeight }
@@ -1867,6 +2132,7 @@ function Show-ExportDialog {
 '@
     $exportReader = New-Object System.Xml.XmlNodeReader $exportXaml
     $exportWindow = [Windows.Markup.XamlReader]::Load($exportReader)
+    Disable-ButtonFocusVisuals $exportWindow
     $exportWindow.Owner = $window
     $completedCheckBox = $exportWindow.FindName('CompletedCheckBox')
     $plannedCheckBox = $exportWindow.FindName('PlannedCheckBox')
@@ -2224,6 +2490,11 @@ function Refresh-Tasks {
                         [void][Windows.DragDrop]::DoDragDrop($sender, [string]$sender.Tag, [Windows.DragDropEffects]::Move)
                     }
                     finally {
+                        Reset-TaskDropGapAnimation
+                        if ($null -ne $script:DropTargetCard) {
+                            Animate-CardScale $script:DropTargetCard 1 100
+                            $script:DropTargetCard = $null
+                        }
                         Animate-CardOpacity $sourceCard 1 150
                         Animate-CardScale $sourceCard 1 150
                     }
@@ -2444,8 +2715,14 @@ $taskList.Add_DragOver({
     $dropLocation = Get-TaskDropLocation $sourceId $pointer.Y
     if ($null -eq $dropLocation) {
         $eventArgs.Effects = [Windows.DragDropEffects]::None
+        Reset-TaskDropGapAnimation
+        if ($null -ne $script:DropTargetCard) {
+            Animate-CardScale $script:DropTargetCard 1 100
+            $script:DropTargetCard = $null
+        }
     } else {
         $eventArgs.Effects = [Windows.DragDropEffects]::Move
+        Update-TaskDropGapAnimation $sourceId $dropLocation
         if ($script:DropTargetCard -ne $dropLocation.Card) {
             if ($null -ne $script:DropTargetCard) { Animate-CardScale $script:DropTargetCard 1 100 }
             $script:DropTargetCard = $dropLocation.Card
@@ -2460,6 +2737,7 @@ $taskList.Add_DragLeave({
         Animate-CardScale $script:DropTargetCard 1 100
         $script:DropTargetCard = $null
     }
+    Reset-TaskDropGapAnimation
 })
 $taskList.Add_Drop({
     param($sender, $eventArgs)
@@ -2468,6 +2746,7 @@ $taskList.Add_Drop({
     $dropLocation = Get-TaskDropLocation $sourceId $pointer.Y
     if ($null -ne $script:DropTargetCard) { Animate-CardScale $script:DropTargetCard 1 80 }
     $script:DropTargetCard = $null
+    Reset-TaskDropGapAnimation
     if ($null -ne $dropLocation) {
         Move-TaskWithinLevel $sourceId $dropLocation.TargetId ([bool]$dropLocation.PlaceAfter)
         $eventArgs.Effects = [Windows.DragDropEffects]::Move
