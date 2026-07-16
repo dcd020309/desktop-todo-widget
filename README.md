@@ -2,13 +2,15 @@
 
 一个无需安装依赖、附着在 Windows 桌面层的待办小组件。
 
-当前版本：`1.3.1`（正式版）
+当前版本：`1.3.3`（正式版）
 
 ## 启动
 
-双击 `Start-Todo.vbs`。这是推荐入口，启动过程不会出现命令行窗口。
+首次下载后，双击 `Install-Todo.vbs`，程序会在 Windows 桌面创建 `Desktop Todo` 快捷方式。该快捷方式使用与程序托盘一致的图标，并通过 `wscript.exe` 静默启动，不显示命令行窗口。
 
-`Start-Todo.bat` 仅作为兼容入口保留；Windows 打开任何 `.bat` 文件时都会创建 `cmd.exe`，因此无法从 BAT 文件本身彻底消除瞬间闪烁。
+也可以直接双击 `Start-Todo.vbs` 静默启动，但 `.vbs` 文件本身的图标由 Windows Script Host 决定，无法显示程序的自定义图标。请勿直接双击 `TodoWidget.ps1`，否则 Windows 可能显示 PowerShell 窗口。
+
+项目不再提供 BAT 启动入口，因为 Windows 打开任何 `.bat` 文件时都会先创建 `cmd.exe` 或 Windows Terminal 窗口，无法保证完全静默。
 
 也可以在 PowerShell 中运行：
 
@@ -22,6 +24,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TodoWidget.ps1
 - 可在待办右侧三点管理窗口中修改已添加待办的文字
 - 可在三点管理窗口中删除已有详细说明，并将删除状态用于多电脑手动同步
 - 拖动待办经过可插入位置时，相邻卡片会平滑向上下两侧让开并显示落点空隙
+- OneDrive 设备快照只写入纯文本详细说明并使用紧凑 JSON，避免 PowerShell 文件元数据造成快照异常膨胀
 - 通过 DDL 复选框决定是否为待办设置截止日期
 - 显示 DDL 剩余或逾期天数
 - 可为新待办选择一项“前置任务”

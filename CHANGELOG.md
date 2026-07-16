@@ -2,6 +2,23 @@
 
 本项目使用语义化版本号。后续每次功能或修复更新，都需要同时修改 `VERSION`、程序内版本号和本文件。
 
+## 1.3.3 - 2026-07-16
+
+- 修复在其他电脑通过 GitHub 下载后，启动图标与程序托盘图标不一致、误用 BAT 后出现命令行窗口的问题。
+- 新增 `Install-Todo.vbs`：一键在当前用户桌面创建 `Desktop Todo` 快捷方式，统一使用 `assets/todo-icon.ico`。
+- 桌面快捷方式固定通过系统 `wscript.exe` 调用 `Start-Todo.vbs`，启动过程不创建 `cmd.exe`。
+- `Start-Todo.vbs` 改用 Windows PowerShell 绝对路径，并继续以隐藏、非交互方式运行，避免不同电脑的 PATH 或默认终端设置影响启动。
+- 删除 `Start-Todo.bat`，从分发包中移除无法保证完全静默的入口；README 增加首次安装和正确启动说明。
+- GitHub 默认分支需要更新至本版本，确保使用“Download ZIP”时获得最新代码而非旧版 `0.20.0`。
+
+## 1.3.2 - 2026-07-16
+
+- 修复 OneDrive 设备快照可能从几 KB 异常膨胀到约 100 MB 的问题。
+- 根因是 Windows PowerShell 为 `Get-Content` 返回值附加了 `PSPath`、`PSDrive`、`PSProvider` 等文件系统元数据，序列化时被递归写入 JSON。
+- 详细说明改用 .NET 纯文本读取，确保 `detailContent` 始终是普通字符串；同步快照同时改用紧凑 JSON。
+- 兼容旧版异常快照：检测到对象形式的 `detailContent` 时提取其中的 `value` 正文，避免说明内容变成对象描述文字。
+- 现有异常快照可在备份后安全重写，待办、删除记录及详细说明正文保持不变。
+
 ## 1.3.1 - 2026-07-16
 
 - 移除点击按钮后由 WPF 默认键盘焦点样式产生的黑色虚线选择框。
