@@ -24,7 +24,7 @@ $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '1.3.3'
+$script:Version = '1.4.0'
 
 trap {
     $details = ($_ | Out-String)
@@ -267,9 +267,11 @@ function Get-LastSyncDisplayText {
 }
 
 function New-SyncBackup {
+    param([ValidateSet('upload','download')][string]$Direction)
     Save-State
     $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
-    $backupPath = Join-Path $script:BackupDirectory "${timestamp}_同步前备份"
+    $directionLabel = if ($Direction -eq 'upload') { '上传前备份' } else { '下载前备份' }
+    $backupPath = Join-Path $script:BackupDirectory "${timestamp}_${directionLabel}"
     $detailBackupPath = Join-Path $backupPath 'detail'
     New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
     Copy-Item -LiteralPath $script:StatePath -Destination (Join-Path $backupPath 'state.json') -Force
@@ -288,7 +290,7 @@ function New-SyncBackup {
         backupVersion = 1
         appVersion = $script:Version
         backupTime = (Get-UtcTimestamp)
-        reason = 'manual-onedrive-sync'
+        reason = "manual-onedrive-$Direction"
         deviceId = $script:DeviceId
         taskCount = $script:Tasks.Count
         deletedTaskCount = $script:DeletedTasks.Count
@@ -388,7 +390,49 @@ function ConvertFrom-SyncTaskRecord {
     }
 }
 
-function Invoke-ManualOneDriveSync {
+function Write-LocalDeviceSyncSnapshot {
+    param([string]$DevicesDirectory)
+    $outputSnapshot = New-DeviceSyncSnapshot
+    $snapshotPath = Join-Path $DevicesDirectory "$script:DeviceId.json"
+    $temporarySnapshotPath = Join-Path $DevicesDirectory ".$script:DeviceId.tmp"
+    try {
+        $json = $outputSnapshot | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::WriteAllText($temporarySnapshotPath, $json, [Text.UTF8Encoding]::new($false))
+        [void](Get-Content -LiteralPath $temporarySnapshotPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+        Move-Item -LiteralPath $temporarySnapshotPath -Destination $snapshotPath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporarySnapshotPath -Force -ErrorAction SilentlyContinue
+    }
+    return $snapshotPath
+}
+
+function Invoke-OneDriveUpload {
+    param([string]$SyncDirectory)
+    if ([string]::IsNullOrWhiteSpace($SyncDirectory)) { throw '未找到 OneDrive 文件夹，请选择同步目录。' }
+
+    $resolvedSyncDirectory = [IO.Path]::GetFullPath($SyncDirectory.Trim())
+    $devicesDirectory = Join-Path $resolvedSyncDirectory 'devices'
+    New-Item -ItemType Directory -Path $devicesDirectory -Force | Out-Null
+
+    $backupPath = New-SyncBackup 'upload'
+    Update-LocalDetailMetadata
+    Save-State
+    $snapshotPath = Write-LocalDeviceSyncSnapshot $devicesDirectory
+
+    $script:SyncDirectory = $resolvedSyncDirectory
+    $script:LastSyncAt = Get-UtcTimestamp
+    Save-State
+    return [PSCustomObject]@{
+        TaskCount = $script:Tasks.Count
+        DeletedTaskCount = $script:DeletedTasks.Count
+        BackupPath = $backupPath
+        SnapshotPath = $snapshotPath
+        SyncDirectory = $resolvedSyncDirectory
+    }
+}
+
+function Invoke-OneDriveDownload {
     param([string]$SyncDirectory)
     if ([string]::IsNullOrWhiteSpace($SyncDirectory)) { throw '未找到 OneDrive 文件夹，请选择同步目录。' }
 
@@ -397,7 +441,7 @@ function Invoke-ManualOneDriveSync {
     New-Item -ItemType Directory -Path $devicesDirectory -Force | Out-Null
 
     # A complete local backup is the first data-changing step of every sync.
-    $backupPath = New-SyncBackup
+    $backupPath = New-SyncBackup 'download'
     Update-LocalDetailMetadata
 
     $sources = [Collections.Generic.List[object]]::new()
@@ -522,20 +566,13 @@ function Invoke-ManualOneDriveSync {
         }
     }
 
-    Save-State
-    $outputSnapshot = New-DeviceSyncSnapshot
-    $snapshotPath = Join-Path $devicesDirectory "$script:DeviceId.json"
-    $temporarySnapshotPath = Join-Path $devicesDirectory ".$script:DeviceId.tmp"
-    $outputSnapshot | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $temporarySnapshotPath -Encoding UTF8
-    Move-Item -LiteralPath $temporarySnapshotPath -Destination $snapshotPath -Force
-
     $script:SyncDirectory = $resolvedSyncDirectory
     $script:LastSyncAt = Get-UtcTimestamp
     Save-State
     return [PSCustomObject]@{
         TaskCount = $script:Tasks.Count
         DeletedTaskCount = $script:DeletedTasks.Count
-        DeviceSnapshotCount = $sources.Count
+        DeviceSnapshotCount = [Math]::Max(0, $sources.Count - 1)
         InvalidSnapshotCount = $invalidSnapshotCount
         BackupPath = $backupPath
         SyncDirectory = $resolvedSyncDirectory
@@ -1887,7 +1924,7 @@ function Show-Settings {
             <CheckBox x:Name="AutoStartCheckBox" Content="开机自启动"/>
 
             <TextBlock Margin="0,20,0,8" Text="OneDrive 手动同步" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-            <TextBlock Text="每次点击同步都会先完整备份本机数据，再与其他电脑的快照合并。程序不会自动同步。"
+            <TextBlock Text="上传只写入本机设备快照；下载会读取云端快照并与本地合并，但不会自动回传。两种操作都会先完整备份本机数据。"
                        FontSize="11" Foreground="#FF707580" TextWrapping="Wrap" Margin="0,0,0,9"/>
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -1897,10 +1934,16 @@ function Show-Settings {
                 <TextBox x:Name="SyncDirectoryText" Height="31" FontSize="12" VerticalContentAlignment="Center" Padding="8,0"/>
                 <Button x:Name="BrowseSyncDirectoryButton" Grid.Column="1" Content="选择…" Width="72" Height="31" Margin="8,0,0,0"/>
             </Grid>
-            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
-                <Button x:Name="SyncNowButton" Content="立即同步" Width="104" Height="34" Background="#FF6C5CE7" Foreground="White"/>
-                <TextBlock x:Name="LastSyncText" Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
-            </StackPanel>
+            <Grid Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="10"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Button x:Name="UploadSyncButton" Grid.Column="0" Content="上传同步信息" Height="34" Background="#FF6C5CE7" Foreground="White"/>
+                <Button x:Name="DownloadSyncButton" Grid.Column="2" Content="下载同步信息" Height="34" Background="#FF5879B8" Foreground="White"/>
+            </Grid>
+            <TextBlock x:Name="LastSyncText" Margin="0,7,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
             <TextBlock x:Name="SyncStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
             <TextBlock x:Name="BackupStorageText" Margin="0,5,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
 
@@ -1941,7 +1984,8 @@ function Show-Settings {
     $autoStartCheckBox = $settingsWindow.FindName('AutoStartCheckBox')
     $syncDirectoryText = $settingsWindow.FindName('SyncDirectoryText')
     $browseSyncDirectoryButton = $settingsWindow.FindName('BrowseSyncDirectoryButton')
-    $syncNowButton = $settingsWindow.FindName('SyncNowButton')
+    $uploadSyncButton = $settingsWindow.FindName('UploadSyncButton')
+    $downloadSyncButton = $settingsWindow.FindName('DownloadSyncButton')
     $lastSyncText = $settingsWindow.FindName('LastSyncText')
     $syncStatusText = $settingsWindow.FindName('SyncStatusText')
     $backupStorageText = $settingsWindow.FindName('BackupStorageText')
@@ -1978,39 +2022,49 @@ function Show-Settings {
         }
     })
 
-    $syncNowButton.Add_Click({
+    $runSyncAction = {
+        param([ValidateSet('upload','download')][string]$direction)
         $requestedSyncDirectory = $syncDirectoryText.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($requestedSyncDirectory)) {
             $requestedSyncDirectory = Get-DefaultSyncDirectory
             $syncDirectoryText.Text = [string]$requestedSyncDirectory
         }
-        $syncNowButton.IsEnabled = $false
+        $uploadSyncButton.IsEnabled = $false
+        $downloadSyncButton.IsEnabled = $false
         $browseSyncDirectoryButton.IsEnabled = $false
         $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
-        $syncStatusText.Text = '正在创建本地备份并合并 OneDrive 快照…'
+        $syncStatusText.Text = if ($direction -eq 'upload') { '正在备份本机数据并上传设备快照…' } else { '正在备份本机数据并下载、合并云端快照…' }
         [System.Windows.Forms.Application]::DoEvents()
         try {
-            $result = Invoke-ManualOneDriveSync $requestedSyncDirectory
+            $result = if ($direction -eq 'upload') { Invoke-OneDriveUpload $requestedSyncDirectory } else { Invoke-OneDriveDownload $requestedSyncDirectory }
             Refresh-Tasks
             $syncDirectoryText.Text = $script:SyncDirectory
             $lastSyncText.Text = Get-LastSyncDisplayText
-            $warningText = if ($result.InvalidSnapshotCount -gt 0) { "；跳过 $($result.InvalidSnapshotCount) 个无效快照" } else { '' }
             $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
-            $syncStatusText.Text = "同步完成：$($result.TaskCount) 项待办，合并 $($result.DeviceSnapshotCount) 个来源$warningText。OneDrive仍在上传时，其他电脑可能需要稍后再次同步。"
+            if ($direction -eq 'upload') {
+                $syncStatusText.Text = "上传完成：已写入 $($result.TaskCount) 项待办和 $($result.DeletedTaskCount) 条删除记录。请等待 OneDrive 完成云端传输。"
+            } else {
+                $warningText = if ($result.InvalidSnapshotCount -gt 0) { "；跳过 $($result.InvalidSnapshotCount) 个无效快照" } else { '' }
+                $syncStatusText.Text = "下载完成：已合并 $($result.DeviceSnapshotCount) 个云端设备快照，当前共 $($result.TaskCount) 项待办$warningText。本次结果尚未上传。"
+            }
             $backupInfo = Get-BackupStorageInfo
             $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
         }
         catch {
             $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
-            $syncStatusText.Text = "同步失败：$($_.Exception.Message)"
+            $actionLabel = if ($direction -eq 'upload') { '上传' } else { '下载' }
+            $syncStatusText.Text = "${actionLabel}失败：$($_.Exception.Message)"
             $backupInfo = Get-BackupStorageInfo
             $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
         }
         finally {
-            $syncNowButton.IsEnabled = $true
+            $uploadSyncButton.IsEnabled = $true
+            $downloadSyncButton.IsEnabled = $true
             $browseSyncDirectoryButton.IsEnabled = $true
         }
-    })
+    }
+    $uploadSyncButton.Add_Click({ & $runSyncAction 'upload' })
+    $downloadSyncButton.Add_Click({ & $runSyncAction 'download' })
 
     $runBulkClear = {
         param([bool]$completed, [string]$category)
