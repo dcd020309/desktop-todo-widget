@@ -18,12 +18,13 @@ if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
 $script:AppDirectory = Join-Path $env:LOCALAPPDATA 'DesktopTodoDemo'
 $script:StatePath = Join-Path $script:AppDirectory 'state.json'
 $script:LauncherPath = Join-Path $PSScriptRoot 'Start-Todo.vbs'
+$script:RestartLauncherPath = Join-Path $PSScriptRoot 'Restart-Todo.vbs'
 $script:IconPath = Join-Path $PSScriptRoot 'assets\todo-icon.ico'
 $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '0.20.0'
+$script:Version = '1.3.1'
 
 trap {
     $details = ($_ | Out-String)
@@ -55,6 +56,7 @@ if (-not $createdNewInstance) {
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class DesktopWidgetNative
 {
@@ -83,6 +85,30 @@ public static class DesktopWidgetNative
 
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindow(string className, string windowName);
@@ -118,6 +144,7 @@ public static class DesktopWidgetNative
 '@
 
 $script:Tasks = @()
+$script:DeletedTasks = @()
 $script:CurrentFilter = 'all'
 $script:IsLocked = $false
 $script:UrgentDays = 3
@@ -125,10 +152,12 @@ $script:CardActionMode = 'unified'
 $script:WindowLayerMode = 'desktop'
 $script:AutoStartEnabled = $false
 $script:DisplayTitle = '我的一天'
+$script:DeviceId = $null
+$script:SyncDirectory = $null
+$script:LastSyncAt = $null
 $script:DesktopHandle = [IntPtr]::Zero
 $script:WidgetHandle = [IntPtr]::Zero
 $script:BottomEnforcementTimer = $null
-$script:ScreenCheckTimer = $null
 $script:TrayIcon = $null
 $script:TrayMenu = $null
 $script:AppIcon = $null
@@ -137,9 +166,363 @@ $script:ExportType = 'completed'
 $script:ExportStartDate = $null
 $script:ExportEndDate = $null
 $script:DropTargetCard = $null
+$script:DropGapKey = $null
 
 function New-TaskId {
     return [Guid]::NewGuid().ToString('N')
+}
+
+function Get-UtcTimestamp {
+    return [DateTimeOffset]::UtcNow.ToString('o')
+}
+
+function Set-ObjectProperty {
+    param($InputObject, [string]$Name, $Value)
+    if ($null -eq $InputObject) { return }
+    if ($InputObject.PSObject.Properties.Name -contains $Name) {
+        $InputObject.$Name = $Value
+    } else {
+        $InputObject | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
+function Set-TaskModified {
+    param($Task, [AllowNull()][string]$Timestamp)
+    if ($null -eq $Task) { return }
+    $stamp = if ([string]::IsNullOrWhiteSpace($Timestamp)) { Get-UtcTimestamp } else { $Timestamp }
+    Set-ObjectProperty $Task 'updatedAt' $stamp
+    Set-ObjectProperty $Task 'updatedBy' $script:DeviceId
+}
+
+function Add-DeletionTombstone {
+    param([string]$TaskId, [AllowNull()][string]$Timestamp)
+    if ([string]::IsNullOrWhiteSpace($TaskId)) { return }
+    $stamp = if ([string]::IsNullOrWhiteSpace($Timestamp)) { Get-UtcTimestamp } else { $Timestamp }
+    $script:DeletedTasks = @($script:DeletedTasks | Where-Object { [string]$_.id -ne $TaskId }) + @(
+        [PSCustomObject]@{ id = $TaskId; deletedAt = $stamp; deletedBy = $script:DeviceId }
+    )
+}
+
+function Get-TimestampTicks {
+    param([AllowNull()][string]$Timestamp)
+    if ([string]::IsNullOrWhiteSpace($Timestamp)) { return [long]::MinValue }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($Timestamp, [ref]$parsed)) {
+        return $parsed.UtcDateTime.Ticks
+    }
+    return [long]::MinValue
+}
+
+function Test-SyncCandidateIsNewer {
+    param(
+        [AllowNull()][string]$CandidateTimestamp,
+        [AllowNull()][string]$CandidateDeviceId,
+        [AllowNull()][string]$ExistingTimestamp,
+        [AllowNull()][string]$ExistingDeviceId
+    )
+    $candidateTicks = Get-TimestampTicks $CandidateTimestamp
+    $existingTicks = Get-TimestampTicks $ExistingTimestamp
+    if ($candidateTicks -ne $existingTicks) { return $candidateTicks -gt $existingTicks }
+    return [string]::CompareOrdinal([string]$CandidateDeviceId, [string]$ExistingDeviceId) -gt 0
+}
+
+function Get-DefaultSyncDirectory {
+    $candidates = @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        Select-Object -Unique
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return Join-Path $candidate 'DesktopTodoSync'
+        }
+    }
+    return $null
+}
+
+function Get-FriendlySize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N2} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N2} KB' -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+function Get-BackupStorageInfo {
+    $files = @()
+    if (Test-Path -LiteralPath $script:BackupDirectory) {
+        $files = @(Get-ChildItem -LiteralPath $script:BackupDirectory -File -Recurse -ErrorAction SilentlyContinue)
+    }
+    $bytes = [long]0
+    foreach ($file in $files) { $bytes += [long]$file.Length }
+    $backupCount = if (Test-Path -LiteralPath $script:BackupDirectory) {
+        @(Get-ChildItem -LiteralPath $script:BackupDirectory -Directory -ErrorAction SilentlyContinue).Count
+    } else { 0 }
+    return [PSCustomObject]@{ Bytes = $bytes; FileCount = $files.Count; BackupCount = $backupCount; DisplaySize = (Get-FriendlySize $bytes) }
+}
+
+function Get-LastSyncDisplayText {
+    if ([string]::IsNullOrWhiteSpace($script:LastSyncAt)) { return '尚未同步' }
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($script:LastSyncAt, [ref]$parsed)) { return '尚未同步' }
+    return "上次同步：$($parsed.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))"
+}
+
+function New-SyncBackup {
+    Save-State
+    $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
+    $backupPath = Join-Path $script:BackupDirectory "${timestamp}_同步前备份"
+    $detailBackupPath = Join-Path $backupPath 'detail'
+    New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+    Copy-Item -LiteralPath $script:StatePath -Destination (Join-Path $backupPath 'state.json') -Force
+
+    if (Test-Path -LiteralPath $script:DetailDirectory) {
+        $detailFiles = @(Get-ChildItem -LiteralPath $script:DetailDirectory -File -ErrorAction SilentlyContinue)
+        if ($detailFiles.Count -gt 0) {
+            New-Item -ItemType Directory -Path $detailBackupPath -Force | Out-Null
+            foreach ($detailFile in $detailFiles) {
+                Copy-Item -LiteralPath $detailFile.FullName -Destination (Join-Path $detailBackupPath $detailFile.Name) -Force
+            }
+        }
+    }
+
+    [PSCustomObject]@{
+        backupVersion = 1
+        appVersion = $script:Version
+        backupTime = (Get-UtcTimestamp)
+        reason = 'manual-onedrive-sync'
+        deviceId = $script:DeviceId
+        taskCount = $script:Tasks.Count
+        deletedTaskCount = $script:DeletedTasks.Count
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $backupPath 'backup-info.json') -Encoding UTF8
+    return $backupPath
+}
+
+function Update-LocalDetailMetadata {
+    foreach ($task in $script:Tasks) {
+        $detailPath = Resolve-TaskDetailPath ([string]$task.id)
+        $storedTimestamp = [string]$task.detailUpdatedAt
+        $storedTicks = Get-TimestampTicks $storedTimestamp
+        if ($null -ne $detailPath -and (Test-Path -LiteralPath $detailPath)) {
+            $file = Get-Item -LiteralPath $detailPath
+            $fileTimestamp = [DateTimeOffset]::new($file.LastWriteTimeUtc).ToString('o')
+            $fileTicks = Get-TimestampTicks $fileTimestamp
+            if ([bool]$task.detailDeleted -or $fileTicks -gt $storedTicks) {
+                Set-ObjectProperty $task 'detailUpdatedAt' $fileTimestamp
+                Set-ObjectProperty $task 'detailUpdatedBy' $script:DeviceId
+                Set-ObjectProperty $task 'detailDeleted' $false
+            }
+        } elseif (-not [string]::IsNullOrWhiteSpace($storedTimestamp) -and -not [bool]$task.detailDeleted) {
+            Set-ObjectProperty $task 'detailUpdatedAt' (Get-UtcTimestamp)
+            Set-ObjectProperty $task 'detailUpdatedBy' $script:DeviceId
+            Set-ObjectProperty $task 'detailDeleted' $true
+        }
+    }
+}
+
+function New-TaskSyncRecord {
+    param($Task)
+    $detailPath = Resolve-TaskDetailPath ([string]$Task.id)
+    $hasDetailFile = $null -ne $detailPath -and (Test-Path -LiteralPath $detailPath)
+    $detailContent = if ($hasDetailFile) { Get-Content -LiteralPath $detailPath -Raw -Encoding UTF8 } else { $null }
+    return [PSCustomObject]@{
+        id = [string]$Task.id
+        text = [string]$Task.text
+        completed = [bool]$Task.completed
+        completedAt = if ([string]::IsNullOrWhiteSpace([string]$Task.completedAt)) { $null } else { [string]$Task.completedAt }
+        dueDate = if ([string]::IsNullOrWhiteSpace([string]$Task.dueDate)) { $null } else { [string]$Task.dueDate }
+        prerequisiteId = if ([string]::IsNullOrWhiteSpace([string]$Task.prerequisiteId)) { $null } else { [string]$Task.prerequisiteId }
+        sortOrder = [double]$Task.sortOrder
+        createdAt = [string]$Task.createdAt
+        updatedAt = [string]$Task.updatedAt
+        updatedBy = [string]$Task.updatedBy
+        detailUpdatedAt = if ([string]::IsNullOrWhiteSpace([string]$Task.detailUpdatedAt)) { $null } else { [string]$Task.detailUpdatedAt }
+        detailUpdatedBy = if ([string]::IsNullOrWhiteSpace([string]$Task.detailUpdatedBy)) { $null } else { [string]$Task.detailUpdatedBy }
+        detailDeleted = [bool]$Task.detailDeleted
+        detailContent = $detailContent
+    }
+}
+
+function New-DeviceSyncSnapshot {
+    return [PSCustomObject]@{
+        syncVersion = 1
+        appVersion = $script:Version
+        deviceId = $script:DeviceId
+        deviceName = [Environment]::MachineName
+        generatedAt = (Get-UtcTimestamp)
+        tasks = @($script:Tasks | ForEach-Object { New-TaskSyncRecord $_ })
+        deletedTasks = @($script:DeletedTasks)
+    }
+}
+
+function ConvertFrom-SyncTaskRecord {
+    param($Record)
+    return [PSCustomObject]@{
+        id = [string]$Record.id
+        text = [string]$Record.text
+        completed = [bool]$Record.completed
+        completedAt = if ([string]::IsNullOrWhiteSpace([string]$Record.completedAt)) { $null } else { [string]$Record.completedAt }
+        dueDate = if ([string]::IsNullOrWhiteSpace([string]$Record.dueDate)) { $null } else { [string]$Record.dueDate }
+        prerequisiteId = if ([string]::IsNullOrWhiteSpace([string]$Record.prerequisiteId)) { $null } else { [string]$Record.prerequisiteId }
+        sortOrder = if ($null -eq $Record.sortOrder) { 0 } else { [double]$Record.sortOrder }
+        createdAt = if ([string]::IsNullOrWhiteSpace([string]$Record.createdAt)) { [string]$Record.updatedAt } else { [string]$Record.createdAt }
+        updatedAt = [string]$Record.updatedAt
+        updatedBy = [string]$Record.updatedBy
+        detailUpdatedAt = if ([string]::IsNullOrWhiteSpace([string]$Record.detailUpdatedAt)) { $null } else { [string]$Record.detailUpdatedAt }
+        detailUpdatedBy = if ([string]::IsNullOrWhiteSpace([string]$Record.detailUpdatedBy)) { $null } else { [string]$Record.detailUpdatedBy }
+        detailDeleted = [bool]$Record.detailDeleted
+    }
+}
+
+function Invoke-ManualOneDriveSync {
+    param([string]$SyncDirectory)
+    if ([string]::IsNullOrWhiteSpace($SyncDirectory)) { throw '未找到 OneDrive 文件夹，请选择同步目录。' }
+
+    $resolvedSyncDirectory = [IO.Path]::GetFullPath($SyncDirectory.Trim())
+    $devicesDirectory = Join-Path $resolvedSyncDirectory 'devices'
+    New-Item -ItemType Directory -Path $devicesDirectory -Force | Out-Null
+
+    # A complete local backup is the first data-changing step of every sync.
+    $backupPath = New-SyncBackup
+    Update-LocalDetailMetadata
+
+    $sources = [Collections.Generic.List[object]]::new()
+    $sources.Add((New-DeviceSyncSnapshot))
+    $snapshotFiles = @(Get-ChildItem -LiteralPath $devicesDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $invalidSnapshotCount = 0
+    foreach ($snapshotFile in $snapshotFiles) {
+        try {
+            $snapshot = Get-Content -LiteralPath $snapshotFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -eq $snapshot -or [int]$snapshot.syncVersion -ne 1 -or [string]::IsNullOrWhiteSpace([string]$snapshot.deviceId)) {
+                $invalidSnapshotCount++
+                continue
+            }
+            $sources.Add($snapshot)
+        }
+        catch {
+            $invalidSnapshotCount++
+        }
+    }
+
+    $coreWinners = @{}
+    $detailWinners = @{}
+    foreach ($source in $sources) {
+        $sourceDeviceId = [string]$source.deviceId
+        foreach ($record in @($source.tasks)) {
+            $taskId = [string]$record.id
+            if ([string]::IsNullOrWhiteSpace($taskId)) { continue }
+            $recordTimestamp = [string]$record.updatedAt
+            $recordDeviceId = if ([string]::IsNullOrWhiteSpace([string]$record.updatedBy)) { $sourceDeviceId } else { [string]$record.updatedBy }
+            $existing = $coreWinners[$taskId]
+            if ($null -eq $existing -or (Test-SyncCandidateIsNewer $recordTimestamp $recordDeviceId $existing.Timestamp $existing.DeviceId)) {
+                $coreWinners[$taskId] = [PSCustomObject]@{ Kind = 'task'; Timestamp = $recordTimestamp; DeviceId = $recordDeviceId; Record = $record }
+            }
+
+            $detailTimestamp = [string]$record.detailUpdatedAt
+            if (-not [string]::IsNullOrWhiteSpace($detailTimestamp)) {
+                $detailDeviceId = if ([string]::IsNullOrWhiteSpace([string]$record.detailUpdatedBy)) { $sourceDeviceId } else { [string]$record.detailUpdatedBy }
+                $existingDetail = $detailWinners[$taskId]
+                if ($null -eq $existingDetail -or (Test-SyncCandidateIsNewer $detailTimestamp $detailDeviceId $existingDetail.Timestamp $existingDetail.DeviceId)) {
+                    $detailWinners[$taskId] = [PSCustomObject]@{ Timestamp = $detailTimestamp; DeviceId = $detailDeviceId; Record = $record }
+                }
+            }
+        }
+        foreach ($deletion in @($source.deletedTasks)) {
+            $taskId = [string]$deletion.id
+            if ([string]::IsNullOrWhiteSpace($taskId)) { continue }
+            $deletedAt = [string]$deletion.deletedAt
+            $deletedBy = if ([string]::IsNullOrWhiteSpace([string]$deletion.deletedBy)) { $sourceDeviceId } else { [string]$deletion.deletedBy }
+            $existing = $coreWinners[$taskId]
+            if ($null -eq $existing -or (Test-SyncCandidateIsNewer $deletedAt $deletedBy $existing.Timestamp $existing.DeviceId)) {
+                $coreWinners[$taskId] = [PSCustomObject]@{ Kind = 'deleted'; Timestamp = $deletedAt; DeviceId = $deletedBy; Record = $deletion }
+            }
+        }
+    }
+
+    $oldDetailPaths = @{}
+    foreach ($oldTask in $script:Tasks) {
+        $oldPath = Resolve-TaskDetailPath ([string]$oldTask.id)
+        if ($null -ne $oldPath -and (Test-Path -LiteralPath $oldPath)) { $oldDetailPaths[[string]$oldTask.id] = $oldPath }
+    }
+
+    $mergedTasks = [Collections.Generic.List[object]]::new()
+    $mergedDeletedTasks = [Collections.Generic.List[object]]::new()
+    foreach ($taskId in $coreWinners.Keys) {
+        $winner = $coreWinners[$taskId]
+        if ($winner.Kind -eq 'deleted') {
+            $mergedDeletedTasks.Add([PSCustomObject]@{ id = $taskId; deletedAt = $winner.Timestamp; deletedBy = $winner.DeviceId })
+            continue
+        }
+        $mergedTask = ConvertFrom-SyncTaskRecord $winner.Record
+        $detailWinner = $detailWinners[$taskId]
+        if ($null -ne $detailWinner) {
+            Set-ObjectProperty $mergedTask 'detailUpdatedAt' $detailWinner.Timestamp
+            Set-ObjectProperty $mergedTask 'detailUpdatedBy' $detailWinner.DeviceId
+            Set-ObjectProperty $mergedTask 'detailDeleted' ([bool]$detailWinner.Record.detailDeleted)
+        }
+        $mergedTasks.Add($mergedTask)
+    }
+
+    $script:Tasks = @($mergedTasks)
+    $script:DeletedTasks = @($mergedDeletedTasks)
+    $activeIds = @{}
+    foreach ($task in $script:Tasks) { $activeIds[[string]$task.id] = $true }
+
+    foreach ($oldTaskId in $oldDetailPaths.Keys) {
+        if (-not $activeIds.ContainsKey($oldTaskId)) {
+            Remove-Item -LiteralPath $oldDetailPaths[$oldTaskId] -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($task in $script:Tasks) {
+        $taskId = [string]$task.id
+        $detailWinner = $detailWinners[$taskId]
+        if ($null -eq $detailWinner) { continue }
+        $oldPath = $oldDetailPaths[$taskId]
+        $detailPath = Resolve-TaskDetailPath $taskId
+        if ([bool]$detailWinner.Record.detailDeleted) {
+            if ($null -ne $oldPath -and (Test-Path -LiteralPath $oldPath)) { Remove-Item -LiteralPath $oldPath -Force -ErrorAction SilentlyContinue }
+            if ($null -ne $detailPath -and (Test-Path -LiteralPath $detailPath)) { Remove-Item -LiteralPath $detailPath -Force -ErrorAction SilentlyContinue }
+            continue
+        }
+        New-Item -ItemType Directory -Path $script:DetailDirectory -Force | Out-Null
+        $detailContent = if ($null -eq $detailWinner.Record.detailContent) { '' } else { [string]$detailWinner.Record.detailContent }
+        Set-Content -LiteralPath $detailPath -Value $detailContent -Encoding UTF8 -NoNewline
+        $detailTime = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($detailWinner.Timestamp, [ref]$detailTime)) {
+            (Get-Item -LiteralPath $detailPath).LastWriteTimeUtc = $detailTime.UtcDateTime
+        }
+        if ($null -ne $oldPath -and $oldPath -ne $detailPath -and (Test-Path -LiteralPath $oldPath)) {
+            Remove-Item -LiteralPath $oldPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # A prerequisite removed on another device must not leave an unusable task.
+    $dependencyRepairTimestamp = $null
+    foreach ($task in $script:Tasks) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$task.prerequisiteId) -and -not $activeIds.ContainsKey([string]$task.prerequisiteId)) {
+            if ($null -eq $dependencyRepairTimestamp) { $dependencyRepairTimestamp = Get-UtcTimestamp }
+            $task.prerequisiteId = $null
+            Set-TaskModified $task $dependencyRepairTimestamp
+        }
+    }
+
+    Save-State
+    $outputSnapshot = New-DeviceSyncSnapshot
+    $snapshotPath = Join-Path $devicesDirectory "$script:DeviceId.json"
+    $temporarySnapshotPath = Join-Path $devicesDirectory ".$script:DeviceId.tmp"
+    $outputSnapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporarySnapshotPath -Encoding UTF8
+    Move-Item -LiteralPath $temporarySnapshotPath -Destination $snapshotPath -Force
+
+    $script:SyncDirectory = $resolvedSyncDirectory
+    $script:LastSyncAt = Get-UtcTimestamp
+    Save-State
+    return [PSCustomObject]@{
+        TaskCount = $script:Tasks.Count
+        DeletedTaskCount = $script:DeletedTasks.Count
+        DeviceSnapshotCount = $sources.Count
+        InvalidSnapshotCount = $invalidSnapshotCount
+        BackupPath = $backupPath
+        SyncDirectory = $resolvedSyncDirectory
+    }
 }
 
 function Set-AutoStartEnabled {
@@ -209,6 +592,10 @@ function Open-TaskDetail {
         $detailPath = Resolve-TaskDetailPath $TaskId
         if (-not (Test-Path -LiteralPath $detailPath)) {
             Set-Content -LiteralPath $detailPath -Value "待办：$([string]$task.text)`r`n`r`n" -Encoding UTF8
+            Set-ObjectProperty $task 'detailUpdatedAt' ([DateTimeOffset]::new((Get-Item -LiteralPath $detailPath).LastWriteTimeUtc).ToString('o'))
+            Set-ObjectProperty $task 'detailUpdatedBy' $script:DeviceId
+            Set-ObjectProperty $task 'detailDeleted' $false
+            Save-State
         }
 
         $notepadPath = Join-Path $env:WINDIR 'System32\notepad.exe'
@@ -226,10 +613,30 @@ function Open-TaskDetail {
     }
 }
 
+function Remove-TaskDetail {
+    param([string]$TaskId)
+    $task = Get-TaskById $TaskId
+    if ($null -eq $task) { return $false }
+
+    $detailPath = Resolve-TaskDetailPath $TaskId
+    if ($null -eq $detailPath -or -not (Test-Path -LiteralPath $detailPath)) { return $false }
+
+    Remove-Item -LiteralPath $detailPath -Force -ErrorAction Stop
+    $deletionTimestamp = Get-UtcTimestamp
+    Set-ObjectProperty $task 'detailUpdatedAt' $deletionTimestamp
+    Set-ObjectProperty $task 'detailUpdatedBy' $script:DeviceId
+    Set-ObjectProperty $task 'detailDeleted' $true
+    Set-TaskModified $task $deletionTimestamp
+    Save-State
+    Refresh-Tasks
+    return $true
+}
+
 function Backup-AndRemoveTasks {
     param([bool]$Completed)
 
     $originalTasks = @($script:Tasks)
+    $originalDeletedTasks = @($script:DeletedTasks)
     $originalPrerequisites = @{}
     foreach ($task in $originalTasks) { $originalPrerequisites[[string]$task.id] = [string]$task.prerequisiteId }
     $tasksToRemove = @($script:Tasks | Where-Object { [bool]$_.completed -eq $Completed })
@@ -264,10 +671,17 @@ function Backup-AndRemoveTasks {
     }
 
     $removedIds = @{}
-    foreach ($task in $tasksToRemove) { $removedIds[[string]$task.id] = $true }
+    $deletionTimestamp = Get-UtcTimestamp
+    foreach ($task in $tasksToRemove) {
+        $removedIds[[string]$task.id] = $true
+        Add-DeletionTombstone ([string]$task.id) $deletionTimestamp
+    }
     $script:Tasks = @($script:Tasks | Where-Object { -not $removedIds.ContainsKey([string]$_.id) })
     foreach ($task in $script:Tasks) {
-        if ($removedIds.ContainsKey([string]$task.prerequisiteId)) { $task.prerequisiteId = $null }
+        if ($removedIds.ContainsKey([string]$task.prerequisiteId)) {
+            $task.prerequisiteId = $null
+            Set-TaskModified $task $deletionTimestamp
+        }
     }
     $previousRestoreState = $script:IsRestoringUiState
     $script:IsRestoringUiState = $true
@@ -277,6 +691,7 @@ function Backup-AndRemoveTasks {
     }
     catch {
         $script:Tasks = @($originalTasks)
+        $script:DeletedTasks = @($originalDeletedTasks)
         foreach ($task in $script:Tasks) {
             $oldPrerequisiteId = [string]$originalPrerequisites[[string]$task.id]
             $task.prerequisiteId = if ([string]::IsNullOrWhiteSpace($oldPrerequisiteId)) { $null } else { $oldPrerequisiteId }
@@ -297,10 +712,13 @@ function Backup-AndRemoveTasks {
 
 function Remove-TaskById {
     param([string]$TaskId)
+    $deletionTimestamp = Get-UtcTimestamp
     foreach ($dependentTask in @($script:Tasks | Where-Object { [string]$_.prerequisiteId -eq $TaskId })) {
         $dependentTask.prerequisiteId = $null
+        Set-TaskModified $dependentTask $deletionTimestamp
     }
     $script:Tasks = @($script:Tasks | Where-Object { [string]$_.id -ne $TaskId })
+    Add-DeletionTombstone $TaskId $deletionTimestamp
     Save-State
     Refresh-Tasks
 }
@@ -357,6 +775,7 @@ function Move-TaskWithinLevel {
     $ordered.Insert($targetIndex, $sourceTask)
     for ($index = 0; $index -lt $ordered.Count; $index++) {
         $ordered[$index].sortOrder = $index
+        Set-TaskModified $ordered[$index] $null
     }
     Save-State
     Refresh-Tasks
@@ -395,6 +814,78 @@ function Animate-CardScale {
     $scale.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $yAnimation)
 }
 
+function Animate-CardTranslateY {
+    param($Card, [double]$To, [int]$Milliseconds)
+    if ($null -eq $Card -or $null -eq $Card.RenderTransform -or $Card.RenderTransform.Children.Count -lt 2) { return }
+    $translate = $Card.RenderTransform.Children[1]
+    $animation = [Windows.Media.Animation.DoubleAnimation]::new()
+    $animation.To = $To
+    $animation.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds($Milliseconds))
+    $animation.EasingFunction = New-CardAnimationEase
+    $translate.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $animation)
+}
+
+function Reset-TaskDropGapAnimation {
+    if ($null -eq $script:DropGapKey) { return }
+    foreach ($child in $taskList.Children) {
+        if ($child -is [Windows.Controls.Border]) {
+            Animate-CardTranslateY $child 0 120
+        }
+    }
+    $script:DropGapKey = $null
+}
+
+function Update-TaskDropGapAnimation {
+    param([string]$SourceTaskId, $DropLocation)
+    if ($null -eq $DropLocation -or [string]$DropLocation.TargetId -eq $SourceTaskId) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $gapKey = "$([string]$DropLocation.TargetId)|$([bool]$DropLocation.PlaceAfter)"
+    if ($script:DropGapKey -eq $gapKey) { return }
+    $script:DropGapKey = $gapKey
+
+    $sourceTask = Get-TaskById $SourceTaskId
+    $sourceLevel = Get-TaskReorderLevel $sourceTask
+    if ($null -eq $sourceLevel) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $validCards = [Collections.Generic.List[object]]::new()
+    foreach ($child in $taskList.Children) {
+        if ($child -isnot [Windows.Controls.Border] -or [string]$child.Tag -eq $SourceTaskId) { continue }
+        $candidateTask = Get-TaskById ([string]$child.Tag)
+        if ((Get-TaskReorderLevel $candidateTask) -eq $sourceLevel) {
+            $validCards.Add($child)
+        }
+    }
+
+    $targetIndex = -1
+    for ($index = 0; $index -lt $validCards.Count; $index++) {
+        if ([string]$validCards[$index].Tag -eq [string]$DropLocation.TargetId) {
+            $targetIndex = $index
+            break
+        }
+    }
+    if ($targetIndex -lt 0) {
+        Reset-TaskDropGapAnimation
+        return
+    }
+
+    $beforeIndex = if ([bool]$DropLocation.PlaceAfter) { $targetIndex } else { $targetIndex - 1 }
+    $afterIndex = if ([bool]$DropLocation.PlaceAfter) { $targetIndex + 1 } else { $targetIndex }
+    $beforeCard = if ($beforeIndex -ge 0 -and $beforeIndex -lt $validCards.Count) { $validCards[$beforeIndex] } else { $null }
+    $afterCard = if ($afterIndex -ge 0 -and $afterIndex -lt $validCards.Count) { $validCards[$afterIndex] } else { $null }
+
+    foreach ($child in $taskList.Children) {
+        if ($child -isnot [Windows.Controls.Border] -or [string]$child.Tag -eq $SourceTaskId) { continue }
+        $offset = if ($child -eq $beforeCard) { -9 } elseif ($child -eq $afterCard) { 9 } else { 0 }
+        Animate-CardTranslateY $child $offset 135
+    }
+}
+
 function Animate-CardEntry {
     param($Card)
     if ($null -eq $Card -or $Card.RenderTransform.Children.Count -lt 2) { return }
@@ -431,6 +922,10 @@ function Get-TaskDropLocation {
 
     foreach ($card in $validCards) {
         $top = $card.TranslatePoint([Windows.Point]::new(0, 0), $taskList).Y
+        if ($null -ne $card.RenderTransform -and $card.RenderTransform.Children.Count -ge 2) {
+            # RenderTransform 会参与 TranslatePoint；减去动画位移后，命中判断始终基于原始布局，避免让位动画造成边界抖动。
+            $top -= [double]$card.RenderTransform.Children[1].Y
+        }
         $bottom = $top + $card.ActualHeight
         if ($PointerY -lt $top) {
             return [PSCustomObject]@{ Card = $card; TargetId = [string]$card.Tag; PlaceAfter = $false }
@@ -472,20 +967,45 @@ function Send-WidgetToDesktopBottom {
     }
 }
 
+function Send-WidgetToNormalWindowLayer {
+    if ($script:WidgetHandle -eq [IntPtr]::Zero) { return }
+
+    # Wallpaper mode assigns the desktop window as the native owner. Remove
+    # that owner so window mode participates in the ordinary window z-order.
+    [void][DesktopWidgetNative]::SetWindowLongPtr(
+        $script:WidgetHandle,
+        -8,
+        [IntPtr]::Zero
+    )
+    # HWND_TOP with SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+    # SWP_NOOWNERZORDER makes the widget visible above ordinary windows now,
+    # while still allowing another window to cover it when that window is used.
+    [void][DesktopWidgetNative]::SetWindowPos(
+        $script:WidgetHandle,
+        [IntPtr]::Zero,
+        0,
+        0,
+        0,
+        0,
+        0x0213
+    )
+}
+
 function Apply-WindowLayerMode {
     if ($null -ne $script:BottomEnforcementTimer) {
         $script:BottomEnforcementTimer.Stop()
     }
 
-    Send-WidgetToDesktopBottom
-
     if ($script:WindowLayerMode -eq 'alwaysBottom') {
+        Send-WidgetToDesktopBottom
         if ($null -eq $script:BottomEnforcementTimer) {
             $script:BottomEnforcementTimer = [Windows.Threading.DispatcherTimer]::new()
             $script:BottomEnforcementTimer.Interval = [TimeSpan]::FromMilliseconds(400)
             $script:BottomEnforcementTimer.Add_Tick({ Send-WidgetToDesktopBottom })
         }
         $script:BottomEnforcementTimer.Start()
+    } else {
+        Send-WidgetToNormalWindowLayer
     }
 }
 
@@ -525,17 +1045,8 @@ function Ensure-WidgetOnVisibleScreen {
         0,
         0x0015
     )
-    Send-WidgetToDesktopBottom
+    Apply-WindowLayerMode
     Save-State
-}
-
-function Start-ScreenMonitoring {
-    if ($null -eq $script:ScreenCheckTimer) {
-        $script:ScreenCheckTimer = [Windows.Threading.DispatcherTimer]::new()
-        $script:ScreenCheckTimer.Interval = [TimeSpan]::FromSeconds(2)
-        $script:ScreenCheckTimer.Add_Tick({ Ensure-WidgetOnVisibleScreen })
-    }
-    if (-not $script:ScreenCheckTimer.IsEnabled) { $script:ScreenCheckTimer.Start() }
 }
 
 function Move-WidgetToPrimaryScreen {
@@ -552,15 +1063,98 @@ function Move-WidgetToPrimaryScreen {
     $newTop = [int]($workingArea.Top + [Math]::Max(0, ($workingArea.Height - $windowHeight) / 2))
 
     [void][DesktopWidgetNative]::SetWindowPos($script:WidgetHandle, [IntPtr]::Zero, $newLeft, $newTop, 0, 0, 0x0015)
-    Send-WidgetToDesktopBottom
+    Apply-WindowLayerMode
     Save-State
 }
 
-function Show-WidgetFromTray {
+function Locate-WidgetFromTray {
     if ($window.WindowState -eq [Windows.WindowState]::Minimized) { $window.WindowState = [Windows.WindowState]::Normal }
     if (-not $window.IsVisible) { $window.Show() }
     Move-WidgetToPrimaryScreen
     [void]$window.Activate()
+}
+
+function Minimize-OtherWindowsOnWidgetScreen {
+    if ($script:WidgetHandle -eq [IntPtr]::Zero) { return }
+
+    # MONITOR_DEFAULTTONEAREST selects the monitor containing the largest
+    # part of the widget when it spans two screens.
+    $targetMonitor = [DesktopWidgetNative]::MonitorFromWindow($script:WidgetHandle, 2)
+    if ($targetMonitor -eq [IntPtr]::Zero) { return }
+
+    $currentProcessId = [uint32][Diagnostics.Process]::GetCurrentProcess().Id
+    $shellWindow = [DesktopWidgetNative]::GetShellWindow()
+    $callback = [DesktopWidgetNative+EnumWindowsProc]{
+        param([IntPtr]$candidateHandle, [IntPtr]$ignored)
+
+        try {
+            if ($candidateHandle -eq $script:WidgetHandle -or $candidateHandle -eq $shellWindow) { return $true }
+            if (-not [DesktopWidgetNative]::IsWindowVisible($candidateHandle)) { return $true }
+            if ([DesktopWidgetNative]::IsIconic($candidateHandle)) { return $true }
+            if ([DesktopWidgetNative]::MonitorFromWindow($candidateHandle, 0) -ne $targetMonitor) { return $true }
+
+            $candidateProcessId = [uint32]0
+            [void][DesktopWidgetNative]::GetWindowThreadProcessId($candidateHandle, [ref]$candidateProcessId)
+            if ($candidateProcessId -eq $currentProcessId) { return $true }
+
+            # Owned windows and non-activating tool windows are not independent
+            # application windows; minimizing them can disturb trays, widgets,
+            # floating palettes, and other system UI.
+            if ([DesktopWidgetNative]::GetWindow($candidateHandle, 4) -ne [IntPtr]::Zero) { return $true }
+            $extendedStyle = [uint32][DesktopWidgetNative]::GetWindowLong($candidateHandle, -20)
+            $isToolWindow = ($extendedStyle -band [uint32]0x00000080) -ne 0
+            $isAppWindow = ($extendedStyle -band [uint32]0x00040000) -ne 0
+            $doesNotActivate = ($extendedStyle -band [uint32]0x08000000) -ne 0
+            if (($isToolWindow -and -not $isAppWindow) -or $doesNotActivate) { return $true }
+
+            $className = [Text.StringBuilder]::new(256)
+            [void][DesktopWidgetNative]::GetClassName($candidateHandle, $className, $className.Capacity)
+            if ([string]$className -in @('Shell_TrayWnd', 'Shell_SecondaryTrayWnd', 'Progman', 'WorkerW')) { return $true }
+
+            # SW_MINIMIZE is asynchronous so one unresponsive application
+            # cannot block the tray double-click handler.
+            [void][DesktopWidgetNative]::ShowWindowAsync($candidateHandle, 6)
+        }
+        catch {
+            # A window may close while EnumWindows is running. Continue with
+            # the remaining windows instead of failing the whole operation.
+        }
+        return $true
+    }
+
+    [void][DesktopWidgetNative]::EnumWindows($callback, [IntPtr]::Zero)
+}
+
+function Reveal-WidgetByMinimizingWindows {
+    if ($window.WindowState -eq [Windows.WindowState]::Minimized) { $window.WindowState = [Windows.WindowState]::Normal }
+    if (-not $window.IsVisible) { $window.Show() }
+    Minimize-OtherWindowsOnWidgetScreen
+}
+
+function Restart-TodoWidget {
+    if (-not (Test-Path -LiteralPath $script:RestartLauncherPath)) {
+        [void][Windows.MessageBox]::Show(
+            "找不到静默重启文件：`n$script:RestartLauncherPath",
+            '重启桌面待办',
+            [Windows.MessageBoxButton]::OK,
+            [Windows.MessageBoxImage]::Error
+        )
+        return
+    }
+
+    try {
+        $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+        Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}"' -f $script:RestartLauncherPath) -WindowStyle Hidden
+        $window.Close()
+    }
+    catch {
+        [void][Windows.MessageBox]::Show(
+            "无法重启桌面待办：`n$($_.Exception.Message)",
+            '重启桌面待办',
+            [Windows.MessageBoxButton]::OK,
+            [Windows.MessageBoxImage]::Error
+        )
+    }
 }
 
 function Initialize-TrayIcon {
@@ -569,11 +1163,13 @@ function Initialize-TrayIcon {
     $script:TrayMenu = [System.Windows.Forms.ContextMenuStrip]::new()
     $locateItem = $script:TrayMenu.Items.Add('定位待办窗口')
     $settingsItem = $script:TrayMenu.Items.Add('打开待办设置')
+    $restartItem = $script:TrayMenu.Items.Add('重启桌面待办')
     [void]$script:TrayMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
     $exitItem = $script:TrayMenu.Items.Add('退出桌面待办')
 
-    $locateItem.Add_Click({ Show-WidgetFromTray })
+    $locateItem.Add_Click({ Locate-WidgetFromTray })
     $settingsItem.Add_Click({ Show-Settings })
+    $restartItem.Add_Click({ Restart-TodoWidget })
     $exitItem.Add_Click({ $window.Close() })
 
     $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
@@ -585,21 +1181,24 @@ function Initialize-TrayIcon {
     }
     $script:TrayIcon.Text = "$($script:DisplayTitle) · 桌面待办 v$script:Version"
     $script:TrayIcon.ContextMenuStrip = $script:TrayMenu
-    $script:TrayIcon.Add_DoubleClick({ Show-WidgetFromTray })
+    $script:TrayIcon.Add_DoubleClick({ Reveal-WidgetByMinimizingWindows })
     $script:TrayIcon.Visible = $true
 }
 
 function Load-State {
+    $defaultDeviceId = [Guid]::NewGuid().ToString('N')
+    $defaultCreatedAt = Get-UtcTimestamp
     $defaultState = [PSCustomObject]@{
         tasks = @(
-            [PSCustomObject]@{ id = (New-TaskId); text = '体验桌面待办小组件'; completed = $false; completedAt = $null; dueDate = (Get-Date).AddDays(2).ToString('yyyy-MM-dd'); prerequisiteId = $null; sortOrder = 0; createdAt = (Get-Date).ToString('o') },
-            [PSCustomObject]@{ id = (New-TaskId); text = '勾选一条已完成的任务'; completed = $true; completedAt = (Get-Date).ToString('o'); dueDate = $null; prerequisiteId = $null; sortOrder = 1; createdAt = (Get-Date).AddMinutes(-1).ToString('o') }
+            [PSCustomObject]@{ id = (New-TaskId); text = '体验桌面待办小组件'; completed = $false; completedAt = $null; dueDate = (Get-Date).AddDays(2).ToString('yyyy-MM-dd'); prerequisiteId = $null; sortOrder = 0; createdAt = $defaultCreatedAt; updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false },
+            [PSCustomObject]@{ id = (New-TaskId); text = '勾选一条已完成的任务'; completed = $true; completedAt = $defaultCreatedAt; dueDate = $null; prerequisiteId = $null; sortOrder = 1; createdAt = (Get-Date).AddMinutes(-1).ToString('o'); updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false }
         )
+        deletedTasks = @()
         left = $null
         top = $null
         height = 610
         locked = $false
-        settings = [PSCustomObject]@{ urgentDays = 3; cardActionMode = 'unified'; windowLayerMode = 'desktop'; autoStartEnabled = $false; displayTitle = '我的一天' }
+        settings = [PSCustomObject]@{ urgentDays = 3; cardActionMode = 'unified'; windowLayerMode = 'desktop'; autoStartEnabled = $false; displayTitle = '我的一天'; deviceId = $defaultDeviceId; syncDirectory = (Get-DefaultSyncDirectory); lastSyncAt = $null }
         ui = [PSCustomObject]@{ useDueDate = $false; dueDate = $null; usePrerequisite = $false; prerequisiteId = $null; currentFilter = 'all'; exportType = 'completed'; exportStartDate = $null; exportEndDate = $null }
     }
 
@@ -610,6 +1209,9 @@ function Load-State {
     try {
         $loaded = Get-Content -LiteralPath $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $loaded.tasks) { $loaded | Add-Member -NotePropertyName tasks -NotePropertyValue @() }
+        if ($loaded.PSObject.Properties.Name -notcontains 'deletedTasks') {
+            $loaded | Add-Member -NotePropertyName deletedTasks -NotePropertyValue @()
+        }
         $taskIndex = 0
         foreach ($task in @($loaded.tasks)) {
             if ($task.PSObject.Properties.Name -notcontains 'dueDate') {
@@ -625,10 +1227,26 @@ function Load-State {
             if ($task.PSObject.Properties.Name -notcontains 'sortOrder') {
                 $task | Add-Member -NotePropertyName sortOrder -NotePropertyValue $taskIndex
             }
+            if ($task.PSObject.Properties.Name -notcontains 'updatedAt') {
+                $legacyUpdatedAt = if (-not [string]::IsNullOrWhiteSpace([string]$task.completedAt)) { [string]$task.completedAt } elseif (-not [string]::IsNullOrWhiteSpace([string]$task.createdAt)) { [string]$task.createdAt } else { Get-UtcTimestamp }
+                $task | Add-Member -NotePropertyName updatedAt -NotePropertyValue $legacyUpdatedAt
+            }
+            if ($task.PSObject.Properties.Name -notcontains 'updatedBy') {
+                $task | Add-Member -NotePropertyName updatedBy -NotePropertyValue ''
+            }
+            if ($task.PSObject.Properties.Name -notcontains 'detailUpdatedAt') {
+                $task | Add-Member -NotePropertyName detailUpdatedAt -NotePropertyValue $null
+            }
+            if ($task.PSObject.Properties.Name -notcontains 'detailUpdatedBy') {
+                $task | Add-Member -NotePropertyName detailUpdatedBy -NotePropertyValue $null
+            }
+            if ($task.PSObject.Properties.Name -notcontains 'detailDeleted') {
+                $task | Add-Member -NotePropertyName detailDeleted -NotePropertyValue $false
+            }
             $taskIndex++
         }
         if ($null -eq $loaded.settings) {
-            $loaded | Add-Member -NotePropertyName settings -NotePropertyValue ([PSCustomObject]@{ urgentDays = 3; cardActionMode = 'unified'; windowLayerMode = 'desktop'; autoStartEnabled = $false; displayTitle = '我的一天' })
+            $loaded | Add-Member -NotePropertyName settings -NotePropertyValue ([PSCustomObject]@{ urgentDays = 3; cardActionMode = 'unified'; windowLayerMode = 'desktop'; autoStartEnabled = $false; displayTitle = '我的一天'; deviceId = $defaultDeviceId; syncDirectory = (Get-DefaultSyncDirectory); lastSyncAt = $null })
         } else {
             if ($loaded.settings.PSObject.Properties.Name -notcontains 'cardActionMode') {
                 $loaded.settings | Add-Member -NotePropertyName cardActionMode -NotePropertyValue 'unified'
@@ -641,6 +1259,15 @@ function Load-State {
             }
             if ($loaded.settings.PSObject.Properties.Name -notcontains 'displayTitle') {
                 $loaded.settings | Add-Member -NotePropertyName displayTitle -NotePropertyValue '我的一天'
+            }
+            if ($loaded.settings.PSObject.Properties.Name -notcontains 'deviceId' -or [string]::IsNullOrWhiteSpace([string]$loaded.settings.deviceId)) {
+                if ($loaded.settings.PSObject.Properties.Name -contains 'deviceId') { $loaded.settings.deviceId = $defaultDeviceId } else { $loaded.settings | Add-Member -NotePropertyName deviceId -NotePropertyValue $defaultDeviceId }
+            }
+            if ($loaded.settings.PSObject.Properties.Name -notcontains 'syncDirectory') {
+                $loaded.settings | Add-Member -NotePropertyName syncDirectory -NotePropertyValue (Get-DefaultSyncDirectory)
+            }
+            if ($loaded.settings.PSObject.Properties.Name -notcontains 'lastSyncAt') {
+                $loaded.settings | Add-Member -NotePropertyName lastSyncAt -NotePropertyValue $null
             }
         }
         if ($null -eq $loaded.ui) {
@@ -670,11 +1297,12 @@ function Save-State {
 
     $state = [PSCustomObject]@{
         tasks = @($script:Tasks)
+        deletedTasks = @($script:DeletedTasks)
         left = $savedLeft
         top = $savedTop
         height = $window.ActualHeight
         locked = $script:IsLocked
-        settings = [PSCustomObject]@{ urgentDays = $script:UrgentDays; cardActionMode = $script:CardActionMode; windowLayerMode = $script:WindowLayerMode; autoStartEnabled = $script:AutoStartEnabled; displayTitle = $script:DisplayTitle }
+        settings = [PSCustomObject]@{ urgentDays = $script:UrgentDays; cardActionMode = $script:CardActionMode; windowLayerMode = $script:WindowLayerMode; autoStartEnabled = $script:AutoStartEnabled; displayTitle = $script:DisplayTitle; deviceId = $script:DeviceId; syncDirectory = $script:SyncDirectory; lastSyncAt = $script:LastSyncAt }
         ui = [PSCustomObject]@{
             useDueDate = [bool]$useDueDateCheckBox.IsChecked
             dueDate = if ($null -eq $dueDatePicker.SelectedDate) { $null } else { ([datetime]$dueDatePicker.SelectedDate).ToString('yyyy-MM-dd') }
@@ -686,12 +1314,28 @@ function Save-State {
             exportEndDate = $script:ExportEndDate
         }
     }
-    $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:StatePath -Encoding UTF8
+    $temporaryStatePath = "$script:StatePath.tmp"
+    $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporaryStatePath -Encoding UTF8
+    Move-Item -LiteralPath $temporaryStatePath -Destination $script:StatePath -Force
 }
 
 function Save-UiStateIfReady {
     if (-not $script:IsRestoringUiState -and $null -ne $window -and $window.IsLoaded) {
         Save-State
+    }
+}
+
+function Disable-ButtonFocusVisuals {
+    param($Root)
+    if ($null -eq $Root) { return }
+    if ($Root -is [Windows.Controls.Button]) {
+        $Root.FocusVisualStyle = $null
+    }
+    if ($Root -isnot [Windows.DependencyObject]) { return }
+    foreach ($child in [Windows.LogicalTreeHelper]::GetChildren($Root)) {
+        if ($child -is [Windows.DependencyObject]) {
+            Disable-ButtonFocusVisuals $child
+        }
     }
 }
 
@@ -707,6 +1351,7 @@ function Save-UiStateIfReady {
         <SolidColorBrush x:Key="Muted" Color="#FF8B909B"/>
         <SolidColorBrush x:Key="Accent" Color="#FF6C5CE7"/>
         <Style TargetType="Button">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontFamily" Value="Microsoft YaHei UI"/>
@@ -714,6 +1359,7 @@ function Save-UiStateIfReady {
             <Setter Property="ToolTipService.ShowDuration" Value="6000"/>
         </Style>
         <Style x:Key="FilterButton" TargetType="Button">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="Foreground" Value="#FF8B909B"/>
             <Setter Property="FontSize" Value="12"/>
@@ -828,6 +1474,7 @@ function Save-UiStateIfReady {
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+Disable-ButtonFocusVisuals $window
 $window.Title = "桌面待办 v$script:Version"
 if (Test-Path -LiteralPath $script:IconPath) {
     $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($script:IconPath, [UriKind]::Absolute))
@@ -924,6 +1571,7 @@ function Show-PrerequisiteEditor {
 '@
     $editorReader = New-Object System.Xml.XmlNodeReader $editorXaml
     $editorWindow = [Windows.Markup.XamlReader]::Load($editorReader)
+    Disable-ButtonFocusVisuals $editorWindow
     $editorWindow.Owner = $window
     $editorWindow.FindName('TaskNameText').Text = "待办：$([string]$targetTask.text)"
     $editorComboBox = $editorWindow.FindName('EditorComboBox')
@@ -958,6 +1606,7 @@ function Show-PrerequisiteEditor {
         $taskToUpdate = Get-TaskById $TaskId
         if ($null -ne $taskToUpdate) {
             $taskToUpdate.prerequisiteId = if ([string]::IsNullOrWhiteSpace($candidateId)) { $null } else { $candidateId }
+            Set-TaskModified $taskToUpdate $null
             Save-State
             Refresh-Tasks
         }
@@ -965,7 +1614,109 @@ function Show-PrerequisiteEditor {
     })
     $cancelEditorButton.Add_Click({ $editorWindow.Close() })
     [void]$editorWindow.ShowDialog()
-    Send-WidgetToDesktopBottom
+    Apply-WindowLayerMode
+}
+
+function Show-TaskTextEditor {
+    param([string]$TaskId)
+    $targetTask = Get-TaskById $TaskId
+    if ($null -eq $targetTask) { return }
+
+    [xml]$textEditorXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="修改待办文字" Width="400" Height="230"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        WindowStyle="ToolWindow" ShowInTaskbar="False"
+        Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
+    <Grid Margin="24,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Text="修改待办文字" FontSize="19" FontWeight="SemiBold" Foreground="#FF20242C"/>
+        <TextBox x:Name="TaskTextEditor" Grid.Row="1" Height="34" Margin="0,16,0,0"
+                 Padding="9,0" FontSize="13" VerticalContentAlignment="Center"/>
+        <TextBlock x:Name="TextEditorValidation" Grid.Row="2" Margin="0,10,0,0"
+                   FontSize="11" Foreground="#FFE05252" TextWrapping="Wrap"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="CancelTextEditorButton" Content="取消" Width="72" Height="32" Margin="0,0,10,0"/>
+            <Button x:Name="SaveTextEditorButton" Content="保存" Width="72" Height="32"
+                    Background="#FF6C5CE7" Foreground="White" BorderThickness="0"/>
+        </StackPanel>
+    </Grid>
+</Window>
+'@
+    $textEditorReader = New-Object System.Xml.XmlNodeReader $textEditorXaml
+    $textEditorWindow = [Windows.Markup.XamlReader]::Load($textEditorReader)
+    Disable-ButtonFocusVisuals $textEditorWindow
+    $textEditorWindow.Owner = $window
+    $taskTextEditor = $textEditorWindow.FindName('TaskTextEditor')
+    $textEditorValidation = $textEditorWindow.FindName('TextEditorValidation')
+    $saveTextEditorButton = $textEditorWindow.FindName('SaveTextEditorButton')
+    $cancelTextEditorButton = $textEditorWindow.FindName('CancelTextEditorButton')
+    $taskTextEditor.Text = [string]$targetTask.text
+    $taskTextEditor.SelectAll()
+
+    $saveTaskText = {
+        $newText = $taskTextEditor.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($newText)) {
+            $textEditorValidation.Text = '待办文字不能为空。'
+            $taskTextEditor.Focus() | Out-Null
+            return
+        }
+
+        $taskToUpdate = Get-TaskById $TaskId
+        if ($null -eq $taskToUpdate) {
+            $textEditorValidation.Text = '该待办已不存在，无法保存。'
+            return
+        }
+        if ($newText -eq [string]$taskToUpdate.text) {
+            $textEditorWindow.DialogResult = $true
+            return
+        }
+
+        $oldText = [string]$taskToUpdate.text
+        $oldDetailPath = Resolve-TaskDetailPath $TaskId
+        $hasDetail = $null -ne $oldDetailPath -and (Test-Path -LiteralPath $oldDetailPath)
+        $taskToUpdate.text = $newText
+        $newDetailPath = Get-TaskDetailPath $TaskId
+
+        try {
+            if ($hasDetail -and $oldDetailPath -ne $newDetailPath) {
+                if (Test-Path -LiteralPath $newDetailPath) {
+                    throw "新的详细说明文件名已存在，请先处理：$newDetailPath"
+                }
+                Move-Item -LiteralPath $oldDetailPath -Destination $newDetailPath -ErrorAction Stop
+            }
+            Set-TaskModified $taskToUpdate $null
+            Save-State
+            Refresh-Tasks
+            $textEditorWindow.DialogResult = $true
+        }
+        catch {
+            $taskToUpdate.text = $oldText
+            if ($hasDetail -and $oldDetailPath -ne $newDetailPath -and
+                -not (Test-Path -LiteralPath $oldDetailPath) -and (Test-Path -LiteralPath $newDetailPath)) {
+                try { Move-Item -LiteralPath $newDetailPath -Destination $oldDetailPath -ErrorAction Stop } catch {}
+            }
+            $textEditorValidation.Text = "无法保存修改：$($_.Exception.Message)"
+        }
+    }
+
+    $saveTextEditorButton.Add_Click($saveTaskText)
+    $taskTextEditor.Add_KeyDown({
+        if ($_.Key -eq [Windows.Input.Key]::Enter) {
+            & $saveTaskText
+            $_.Handled = $true
+        }
+    })
+    $cancelTextEditorButton.Add_Click({ $textEditorWindow.Close() })
+    $textEditorWindow.Add_ContentRendered({ $taskTextEditor.Focus() | Out-Null })
+    [void]$textEditorWindow.ShowDialog()
+    Apply-WindowLayerMode
 }
 
 function Show-TaskActions {
@@ -976,7 +1727,7 @@ function Show-TaskActions {
     [xml]$actionsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="管理待办" Width="360" Height="300"
+        Title="管理待办" Width="360" Height="392"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
         WindowStyle="ToolWindow" ShowInTaskbar="False"
         Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
@@ -990,8 +1741,10 @@ function Show-TaskActions {
         <TextBlock Text="管理待办" FontSize="19" FontWeight="SemiBold" Foreground="#FF20242C"/>
         <TextBlock x:Name="ActionTaskName" Grid.Row="1" Margin="0,10,0,16" FontSize="12" Foreground="#FF707580" TextWrapping="Wrap"/>
         <StackPanel Grid.Row="2">
+            <Button x:Name="EditTaskTextButton" Content="修改待办文字" Height="36" Margin="0,0,0,10" Background="#FFF0EEFC" Foreground="#FF6257C5" BorderThickness="0"/>
             <Button x:Name="EditPrerequisiteButton" Content="修改或取消前置任务" Height="36" Margin="0,0,0,10" Background="#FFECE9FF" Foreground="#FF5A49DA" BorderThickness="0"/>
             <Button x:Name="EditDetailButton" Content="编辑详细说明" Height="36" Margin="0,0,0,10" Background="#FFEDF4FF" Foreground="#FF376CA8" BorderThickness="0"/>
+            <Button x:Name="DeleteDetailButton" Content="删除详细说明" Height="36" Margin="0,0,0,10" Background="#FFFFF3E8" Foreground="#FFB46B29" BorderThickness="0"/>
             <Button x:Name="DeleteTaskButton" Content="删除待办" Height="36" Background="#FFFFECEC" Foreground="#FFC94B4B" BorderThickness="0"/>
         </StackPanel>
         <Button x:Name="CloseActionsButton" Grid.Row="3" Content="关闭" Width="72" Height="30" Margin="0,14,0,0" HorizontalAlignment="Right"/>
@@ -1000,13 +1753,26 @@ function Show-TaskActions {
 '@
     $actionsReader = New-Object System.Xml.XmlNodeReader $actionsXaml
     $actionsWindow = [Windows.Markup.XamlReader]::Load($actionsReader)
+    Disable-ButtonFocusVisuals $actionsWindow
     $actionsWindow.Owner = $window
     $actionsWindow.FindName('ActionTaskName').Text = [string]$targetTask.text
+    $editTaskTextButton = $actionsWindow.FindName('EditTaskTextButton')
     $editPrerequisiteButton = $actionsWindow.FindName('EditPrerequisiteButton')
     $editDetailButton = $actionsWindow.FindName('EditDetailButton')
+    $deleteDetailButton = $actionsWindow.FindName('DeleteDetailButton')
     $deleteTaskButton = $actionsWindow.FindName('DeleteTaskButton')
     $closeActionsButton = $actionsWindow.FindName('CloseActionsButton')
+    $existingDetailPath = Resolve-TaskDetailPath $TaskId
+    $deleteDetailButton.IsEnabled = $null -ne $existingDetailPath -and (Test-Path -LiteralPath $existingDetailPath)
+    if (-not $deleteDetailButton.IsEnabled) {
+        $deleteDetailButton.Content = '暂无详细说明可删除'
+        $deleteDetailButton.Opacity = 0.58
+    }
 
+    $editTaskTextButton.Add_Click({
+        $actionsWindow.Close()
+        Show-TaskTextEditor $TaskId
+    })
     $editPrerequisiteButton.Add_Click({
         $actionsWindow.Close()
         Show-PrerequisiteEditor $TaskId
@@ -1014,6 +1780,39 @@ function Show-TaskActions {
     $editDetailButton.Add_Click({
         $actionsWindow.Close()
         Open-TaskDetail $TaskId
+    })
+    $deleteDetailButton.Add_Click({
+        $currentTask = Get-TaskById $TaskId
+        if ($null -eq $currentTask) {
+            $actionsWindow.Close()
+            return
+        }
+        $answer = [Windows.MessageBox]::Show(
+            $actionsWindow,
+            "确定删除「$([string]$currentTask.text)」的详细说明吗？`n`n删除会在下次手动同步时应用到其他电脑。",
+            '删除详细说明',
+            [Windows.MessageBoxButton]::YesNo,
+            [Windows.MessageBoxImage]::Warning
+        )
+        if ($answer -ne [Windows.MessageBoxResult]::Yes) { return }
+        try {
+            if (Remove-TaskDetail $TaskId) {
+                $actionsWindow.Close()
+            } else {
+                $deleteDetailButton.IsEnabled = $false
+                $deleteDetailButton.Content = '暂无详细说明可删除'
+                $deleteDetailButton.Opacity = 0.58
+            }
+        }
+        catch {
+            [void][Windows.MessageBox]::Show(
+                $actionsWindow,
+                "无法删除详细说明：`n$($_.Exception.Message)",
+                '删除详细说明',
+                [Windows.MessageBoxButton]::OK,
+                [Windows.MessageBoxImage]::Error
+            )
+        }
     })
     $deleteTaskButton.Add_Click({
         $answer = [Windows.MessageBox]::Show(
@@ -1029,64 +1828,80 @@ function Show-TaskActions {
     })
     $closeActionsButton.Add_Click({ $actionsWindow.Close() })
     [void]$actionsWindow.ShowDialog()
-    Send-WidgetToDesktopBottom
+    Apply-WindowLayerMode
 }
 
 function Show-Settings {
     [xml]$settingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="桌面待办设置" Width="380" Height="680"
+        Title="桌面待办设置" Width="440" Height="760"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
         WindowStyle="ToolWindow" ShowInTaskbar="False"
         Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
-    <Grid Margin="24,20">
+    <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Text="待办设置" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,12,0,0">
-            <TextBlock Text="名称" Width="64" VerticalAlignment="Center" FontSize="13" Foreground="#FF40444C"/>
-            <TextBox x:Name="DisplayTitleText" Width="240" Height="30" MaxLength="30" FontSize="13" VerticalContentAlignment="Center" Padding="8,0"/>
-        </StackPanel>
-        <TextBlock Grid.Row="2" Margin="0,12,0,8" Text="剩余天数小于或等于此数值的待办会优先排列："
-                   FontSize="12" Foreground="#FF707580" TextWrapping="Wrap"/>
-        <StackPanel Grid.Row="3" Orientation="Horizontal">
-            <TextBox x:Name="UrgentDaysText" Width="80" Height="30" FontSize="13" VerticalContentAlignment="Center" Padding="8,0"/>
-            <TextBlock Text="天" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="13" Foreground="#FF40444C"/>
-        </StackPanel>
-        <TextBlock Grid.Row="4" Margin="0,20,0,8" Text="卡片操作方式" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-        <StackPanel Grid.Row="5">
+        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="24,20,24,12">
+            <TextBlock Text="待办设置" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                <TextBlock Text="名称" Width="64" VerticalAlignment="Center" FontSize="13" Foreground="#FF40444C"/>
+                <TextBox x:Name="DisplayTitleText" Width="310" Height="30" MaxLength="30" FontSize="13" VerticalContentAlignment="Center" Padding="8,0"/>
+            </StackPanel>
+            <TextBlock Margin="0,12,0,8" Text="剩余天数小于或等于此数值的待办会优先排列："
+                       FontSize="12" Foreground="#FF707580" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal">
+                <TextBox x:Name="UrgentDaysText" Width="80" Height="30" FontSize="13" VerticalContentAlignment="Center" Padding="8,0"/>
+                <TextBlock Text="天" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="13" Foreground="#FF40444C"/>
+            </StackPanel>
+
+            <TextBlock Margin="0,20,0,8" Text="卡片操作方式" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
             <RadioButton x:Name="UnifiedModeRadio" Content="单一管理按钮" Margin="0,0,0,9"/>
             <RadioButton x:Name="SeparateModeRadio" Content="前置任务和删除两个按钮"/>
-        </StackPanel>
-        <TextBlock Grid.Row="6" Margin="0,20,0,8" Text="窗口层级" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-        <StackPanel Grid.Row="7">
+
+            <TextBlock Margin="0,20,0,8" Text="窗口层级" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
             <RadioButton x:Name="DesktopLayerRadio" Content="窗口模式" Margin="0,0,0,9"/>
             <RadioButton x:Name="AlwaysBottomRadio" Content="壁纸模式"/>
+
+            <TextBlock Margin="0,20,0,8" Text="启动" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
+            <CheckBox x:Name="AutoStartCheckBox" Content="开机自启动"/>
+
+            <TextBlock Margin="0,20,0,8" Text="OneDrive 手动同步" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
+            <TextBlock Text="每次点击同步都会先完整备份本机数据，再与其他电脑的快照合并。程序不会自动同步。"
+                       FontSize="11" Foreground="#FF707580" TextWrapping="Wrap" Margin="0,0,0,9"/>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="SyncDirectoryText" Height="31" FontSize="12" VerticalContentAlignment="Center" Padding="8,0"/>
+                <Button x:Name="BrowseSyncDirectoryButton" Grid.Column="1" Content="选择…" Width="72" Height="31" Margin="8,0,0,0"/>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <Button x:Name="SyncNowButton" Content="立即同步" Width="104" Height="34" Background="#FF6C5CE7" Foreground="White"/>
+                <TextBlock x:Name="LastSyncText" Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
+            </StackPanel>
+            <TextBlock x:Name="SyncStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
+            <TextBlock x:Name="BackupStorageText" Margin="0,5,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
+
+            <TextBlock Margin="0,20,0,8" Text="数据管理" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Button x:Name="ClearCompletedButton" Grid.Column="0" Content="备份并清除已完成" Height="34" Margin="0,0,5,0"
+                        Background="#FFF0EEFC" Foreground="#FF6257C5"/>
+                <Button x:Name="ClearIncompleteButton" Grid.Column="1" Content="备份并清除未完成" Height="34" Margin="5,0,0,0"
+                        Background="#FFFBEFF2" Foreground="#FFAD5668"/>
+            </Grid>
+            <TextBlock x:Name="ValidationText" Margin="0,10,0,0" Foreground="#FFE05252" FontSize="11" TextWrapping="Wrap"/>
         </StackPanel>
-        <TextBlock Grid.Row="8" Margin="0,20,0,8" Text="启动" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-        <CheckBox x:Name="AutoStartCheckBox" Grid.Row="9" Content="开机自启动"/>
-        <TextBlock Grid.Row="10" Margin="0,20,0,8" Text="数据管理" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
-        <StackPanel Grid.Row="11" Orientation="Horizontal">
-            <Button x:Name="ClearCompletedButton" Content="备份并清除已完成" Width="150" Height="34" Margin="0,0,10,0" Background="#FFFFF1E8" Foreground="#FFB45C28" BorderThickness="0"/>
-            <Button x:Name="ClearIncompleteButton" Content="备份并清除未完成" Width="150" Height="34" Background="#FFFFECEC" Foreground="#FFC94B4B" BorderThickness="0"/>
-        </StackPanel>
-        <TextBlock x:Name="ValidationText" Grid.Row="12" Margin="0,10,0,0" Foreground="#FFE05252" FontSize="11" TextWrapping="Wrap"/>
-        <StackPanel Grid.Row="13" Orientation="Horizontal" HorizontalAlignment="Right">
+        </ScrollViewer>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="24,12,24,18">
             <Button x:Name="CancelButton" Content="取消" Width="72" Height="32" Margin="0,0,10,0"/>
             <Button x:Name="SaveButton" Content="保存" Width="72" Height="32" Background="#FF6C5CE7" Foreground="White" BorderThickness="0"/>
         </StackPanel>
@@ -1095,7 +1910,10 @@ function Show-Settings {
 '@
     $settingsReader = New-Object System.Xml.XmlNodeReader $settingsXaml
     $settingsWindow = [Windows.Markup.XamlReader]::Load($settingsReader)
+    Disable-ButtonFocusVisuals $settingsWindow
     $settingsWindow.Owner = $window
+    $settingsWindow.MaxHeight = [Math]::Max(520, [Windows.SystemParameters]::WorkArea.Height - 40)
+    if ($settingsWindow.Height -gt $settingsWindow.MaxHeight) { $settingsWindow.Height = $settingsWindow.MaxHeight }
     $displayTitleText = $settingsWindow.FindName('DisplayTitleText')
     $urgentDaysText = $settingsWindow.FindName('UrgentDaysText')
     $validationText = $settingsWindow.FindName('ValidationText')
@@ -1104,6 +1922,12 @@ function Show-Settings {
     $desktopLayerRadio = $settingsWindow.FindName('DesktopLayerRadio')
     $alwaysBottomRadio = $settingsWindow.FindName('AlwaysBottomRadio')
     $autoStartCheckBox = $settingsWindow.FindName('AutoStartCheckBox')
+    $syncDirectoryText = $settingsWindow.FindName('SyncDirectoryText')
+    $browseSyncDirectoryButton = $settingsWindow.FindName('BrowseSyncDirectoryButton')
+    $syncNowButton = $settingsWindow.FindName('SyncNowButton')
+    $lastSyncText = $settingsWindow.FindName('LastSyncText')
+    $syncStatusText = $settingsWindow.FindName('SyncStatusText')
+    $backupStorageText = $settingsWindow.FindName('BackupStorageText')
     $clearCompletedButton = $settingsWindow.FindName('ClearCompletedButton')
     $clearIncompleteButton = $settingsWindow.FindName('ClearIncompleteButton')
     $saveSettingsButton = $settingsWindow.FindName('SaveButton')
@@ -1115,6 +1939,61 @@ function Show-Settings {
     $desktopLayerRadio.IsChecked = $script:WindowLayerMode -ne 'alwaysBottom'
     $alwaysBottomRadio.IsChecked = $script:WindowLayerMode -eq 'alwaysBottom'
     $autoStartCheckBox.IsChecked = $script:AutoStartEnabled
+    $syncDirectoryText.Text = if ([string]::IsNullOrWhiteSpace($script:SyncDirectory)) { [string](Get-DefaultSyncDirectory) } else { $script:SyncDirectory }
+    $lastSyncText.Text = Get-LastSyncDisplayText
+    $backupInfo = Get-BackupStorageInfo
+    $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
+
+    $browseSyncDirectoryButton.Add_Click({
+        $folderDialog = [System.Windows.Forms.FolderBrowserDialog]::new()
+        $folderDialog.Description = '选择或新建 DesktopTodoSync 同步文件夹'
+        $folderDialog.ShowNewFolderButton = $true
+        if (-not [string]::IsNullOrWhiteSpace($syncDirectoryText.Text) -and (Test-Path -LiteralPath $syncDirectoryText.Text)) {
+            $folderDialog.SelectedPath = $syncDirectoryText.Text
+        }
+        try {
+            if ($folderDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $syncDirectoryText.Text = $folderDialog.SelectedPath
+            }
+        }
+        finally {
+            $folderDialog.Dispose()
+        }
+    })
+
+    $syncNowButton.Add_Click({
+        $requestedSyncDirectory = $syncDirectoryText.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($requestedSyncDirectory)) {
+            $requestedSyncDirectory = Get-DefaultSyncDirectory
+            $syncDirectoryText.Text = [string]$requestedSyncDirectory
+        }
+        $syncNowButton.IsEnabled = $false
+        $browseSyncDirectoryButton.IsEnabled = $false
+        $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
+        $syncStatusText.Text = '正在创建本地备份并合并 OneDrive 快照…'
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $result = Invoke-ManualOneDriveSync $requestedSyncDirectory
+            Refresh-Tasks
+            $syncDirectoryText.Text = $script:SyncDirectory
+            $lastSyncText.Text = Get-LastSyncDisplayText
+            $warningText = if ($result.InvalidSnapshotCount -gt 0) { "；跳过 $($result.InvalidSnapshotCount) 个无效快照" } else { '' }
+            $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
+            $syncStatusText.Text = "同步完成：$($result.TaskCount) 项待办，合并 $($result.DeviceSnapshotCount) 个来源$warningText。OneDrive仍在上传时，其他电脑可能需要稍后再次同步。"
+            $backupInfo = Get-BackupStorageInfo
+            $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
+        }
+        catch {
+            $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
+            $syncStatusText.Text = "同步失败：$($_.Exception.Message)"
+            $backupInfo = Get-BackupStorageInfo
+            $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
+        }
+        finally {
+            $syncNowButton.IsEnabled = $true
+            $browseSyncDirectoryButton.IsEnabled = $true
+        }
+    })
 
     $runBulkClear = {
         param([bool]$completed, [string]$category)
@@ -1137,6 +2016,8 @@ function Show-Settings {
             $result = Backup-AndRemoveTasks $completed
             $validationText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
             $validationText.Text = "已备份并清除 $($result.Count) 项。备份位置：$($result.Path)"
+            $backupInfo = Get-BackupStorageInfo
+            $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
         }
         catch {
             $validationText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
@@ -1158,6 +2039,14 @@ function Show-Settings {
             $validationText.Text = '请输入 0 到 365 之间的整数。'
             return
         }
+        $requestedSyncDirectory = $syncDirectoryText.Text.Trim()
+        try {
+            $normalizedSyncDirectory = if ([string]::IsNullOrWhiteSpace($requestedSyncDirectory)) { Get-DefaultSyncDirectory } else { [IO.Path]::GetFullPath($requestedSyncDirectory) }
+        }
+        catch {
+            $validationText.Text = "同步目录无效：$($_.Exception.Message)"
+            return
+        }
         $requestedAutoStart = [bool]$autoStartCheckBox.IsChecked
         try {
             Set-AutoStartEnabled $requestedAutoStart
@@ -1172,6 +2061,7 @@ function Show-Settings {
         $script:WindowLayerMode = if ([bool]$alwaysBottomRadio.IsChecked) { 'alwaysBottom' } else { 'desktop' }
         $script:AutoStartEnabled = $requestedAutoStart
         $script:DisplayTitle = $requestedTitle
+        $script:SyncDirectory = $normalizedSyncDirectory
         $titleText.Text = $script:DisplayTitle
         if ($null -ne $script:TrayIcon) { $script:TrayIcon.Text = "$($script:DisplayTitle) · 桌面待办 v$script:Version" }
         Save-State
@@ -1242,6 +2132,7 @@ function Show-ExportDialog {
 '@
     $exportReader = New-Object System.Xml.XmlNodeReader $exportXaml
     $exportWindow = [Windows.Markup.XamlReader]::Load($exportReader)
+    Disable-ButtonFocusVisuals $exportWindow
     $exportWindow.Owner = $window
     $completedCheckBox = $exportWindow.FindName('CompletedCheckBox')
     $plannedCheckBox = $exportWindow.FindName('PlannedCheckBox')
@@ -1374,7 +2265,7 @@ function Show-ExportDialog {
     })
 
     [void]$exportWindow.ShowDialog()
-    Send-WidgetToDesktopBottom
+    Apply-WindowLayerMode
 }
 
 function Refresh-Tasks {
@@ -1599,6 +2490,11 @@ function Refresh-Tasks {
                         [void][Windows.DragDrop]::DoDragDrop($sender, [string]$sender.Tag, [Windows.DragDropEffects]::Move)
                     }
                     finally {
+                        Reset-TaskDropGapAnimation
+                        if ($null -ne $script:DropTargetCard) {
+                            Animate-CardScale $script:DropTargetCard 1 100
+                            $script:DropTargetCard = $null
+                        }
                         Animate-CardOpacity $sourceCard 1 150
                         Animate-CardScale $sourceCard 1 150
                     }
@@ -1612,6 +2508,7 @@ function Refresh-Tasks {
             if ($null -ne $target) {
                 $target.completed = [bool]$sender.IsChecked
                 $target.completedAt = if ($target.completed) { (Get-Date).ToString('o') } else { $null }
+                Set-TaskModified $target $null
             }
             Save-State
             Refresh-Tasks
@@ -1695,6 +2592,11 @@ function Add-NewTask {
         prerequisiteId = $selectedPrerequisiteId
         sortOrder = $nextSortOrder
         createdAt = (Get-Date).ToString('o')
+        updatedAt = (Get-UtcTimestamp)
+        updatedBy = $script:DeviceId
+        detailUpdatedAt = $null
+        detailUpdatedBy = $null
+        detailDeleted = $false
     }
     $script:Tasks = @($newTask) + @($script:Tasks)
     $newTaskText.Clear()
@@ -1706,6 +2608,11 @@ function Add-NewTask {
 
 $state = Load-State
 $script:Tasks = @($state.tasks)
+$script:DeletedTasks = @($state.deletedTasks)
+$script:DeviceId = if ($null -ne $state.settings -and -not [string]::IsNullOrWhiteSpace([string]$state.settings.deviceId)) { [string]$state.settings.deviceId } else { [Guid]::NewGuid().ToString('N') }
+$savedSyncDirectory = if ($null -eq $state.settings) { $null } else { [string]$state.settings.syncDirectory }
+$script:SyncDirectory = if ([string]::IsNullOrWhiteSpace($savedSyncDirectory)) { Get-DefaultSyncDirectory } else { $savedSyncDirectory }
+$script:LastSyncAt = if ($null -eq $state.settings -or [string]::IsNullOrWhiteSpace([string]$state.settings.lastSyncAt)) { $null } else { [string]$state.settings.lastSyncAt }
 $script:IsLocked = if ($null -eq $state.locked) { $false } else { [bool]$state.locked }
 $script:UrgentDays = if ($null -eq $state.settings -or $null -eq $state.settings.urgentDays) { 3 } else { [Math]::Max(0, [Math]::Min(365, [int]$state.settings.urgentDays)) }
 $script:CardActionMode = if ($null -ne $state.settings -and [string]$state.settings.cardActionMode -eq 'separate') { 'separate' } else { 'unified' }
@@ -1808,8 +2715,14 @@ $taskList.Add_DragOver({
     $dropLocation = Get-TaskDropLocation $sourceId $pointer.Y
     if ($null -eq $dropLocation) {
         $eventArgs.Effects = [Windows.DragDropEffects]::None
+        Reset-TaskDropGapAnimation
+        if ($null -ne $script:DropTargetCard) {
+            Animate-CardScale $script:DropTargetCard 1 100
+            $script:DropTargetCard = $null
+        }
     } else {
         $eventArgs.Effects = [Windows.DragDropEffects]::Move
+        Update-TaskDropGapAnimation $sourceId $dropLocation
         if ($script:DropTargetCard -ne $dropLocation.Card) {
             if ($null -ne $script:DropTargetCard) { Animate-CardScale $script:DropTargetCard 1 100 }
             $script:DropTargetCard = $dropLocation.Card
@@ -1824,6 +2737,7 @@ $taskList.Add_DragLeave({
         Animate-CardScale $script:DropTargetCard 1 100
         $script:DropTargetCard = $null
     }
+    Reset-TaskDropGapAnimation
 })
 $taskList.Add_Drop({
     param($sender, $eventArgs)
@@ -1832,6 +2746,7 @@ $taskList.Add_Drop({
     $dropLocation = Get-TaskDropLocation $sourceId $pointer.Y
     if ($null -ne $script:DropTargetCard) { Animate-CardScale $script:DropTargetCard 1 80 }
     $script:DropTargetCard = $null
+    Reset-TaskDropGapAnimation
     if ($null -ne $dropLocation) {
         Move-TaskWithinLevel $sourceId $dropLocation.TargetId ([bool]$dropLocation.PlaceAfter)
         $eventArgs.Effects = [Windows.DragDropEffects]::Move
@@ -1869,27 +2784,24 @@ $window.Add_SourceInitialized({
     $script:DesktopHandle = [DesktopWidgetNative]::FindDesktopHost()
 
     if ($script:DesktopHandle -ne [IntPtr]::Zero) {
-        # Keep the widget as a top-level WPF window so transparent rendering
-        # remains reliable. Giving it the desktop as owner keeps it associated
-        # with the desktop without turning it into a layered child window.
+        # Keep the widget as a top-level WPF window for reliable transparent
+        # rendering, then apply either ordinary z-order or desktop ownership.
         Apply-WindowLayerMode
     }
 })
 $window.Add_Activated({
-    # Clicking the widget normally raises a top-level window. Correct its
-    # z-order immediately so it always returns to the desktop layer.
+    # Restore the selected behavior after activation: ordinary z-order in
+    # window mode, or the desktop layer in wallpaper mode.
     Apply-WindowLayerMode
 })
 $window.Add_ContentRendered({
     $newTaskText.Focus() | Out-Null
     Apply-WindowLayerMode
     Ensure-WidgetOnVisibleScreen
-    Start-ScreenMonitoring
     Initialize-TrayIcon
 })
 $window.Add_Closing({
     if ($null -ne $script:BottomEnforcementTimer) { $script:BottomEnforcementTimer.Stop() }
-    if ($null -ne $script:ScreenCheckTimer) { $script:ScreenCheckTimer.Stop() }
     try {
         Save-State
     }
