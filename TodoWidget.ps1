@@ -26,7 +26,7 @@ $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
 $script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
-$script:Version = '1.5.0'
+$script:Version = '1.5.2'
 
 trap {
     $details = ($_ | Out-String)
@@ -1490,6 +1490,7 @@ function Disable-ButtonFocusVisuals {
                     <Button x:Name="ExportButton" Content="⇩" Width="34" Height="34" FontSize="17" Foreground="#FF8B909B" Background="Transparent" ToolTip="导出 Markdown 待办记录"/>
                     <Button x:Name="SettingsButton" Content="⚙" Width="34" Height="34" FontSize="15" Foreground="#FF8B909B" Background="Transparent" ToolTip="打开待办设置"/>
                     <Button x:Name="LockButton" Content="◇" Width="34" Height="34" FontSize="17" Foreground="#FF8B909B" Background="Transparent" ToolTip="固定组件位置"/>
+                    <Button x:Name="MinimizeButton" Content="−" Width="34" Height="34" FontSize="20" Foreground="#FF707580" Background="Transparent" ToolTip="最小化到系统托盘"/>
                     <Button x:Name="CloseButton" Content="×" Width="34" Height="34" FontSize="22" Foreground="#FF707580" Background="Transparent" ToolTip="关闭"/>
                 </StackPanel>
             </Grid>
@@ -1570,6 +1571,7 @@ $dueDatePicker = $window.FindName('DueDatePicker')
 $usePrerequisiteCheckBox = $window.FindName('UsePrerequisiteCheckBox')
 $prerequisiteComboBox = $window.FindName('PrerequisiteComboBox')
 $addButton = $window.FindName('AddButton')
+$minimizeButton = $window.FindName('MinimizeButton')
 $closeButton = $window.FindName('CloseButton')
 $exportButton = $window.FindName('ExportButton')
 $settingsButton = $window.FindName('SettingsButton')
@@ -2257,7 +2259,7 @@ function Show-ExportDialog {
         <StackPanel Grid.Row="1" Margin="0,18,0,0">
             <TextBlock Text="导出内容" FontSize="12" FontWeight="SemiBold" Foreground="#FF555A64" Margin="0,0,0,8"/>
             <CheckBox x:Name="CompletedCheckBox" Content="已完成事项（按完成时间筛选）" IsChecked="True" Margin="0,0,0,8"/>
-            <CheckBox x:Name="PlannedCheckBox" Content="未来计划（按 DDL 筛选，仅未完成）"/>
+            <CheckBox x:Name="PlannedCheckBox" Content="未完成事项（有 DDL 时按 DDL 筛选）"/>
         </StackPanel>
 
         <TextBlock Grid.Row="2" Text="时间范围" FontSize="12" FontWeight="SemiBold" Foreground="#FF555A64" Margin="0,18,0,8"/>
@@ -2306,9 +2308,9 @@ function Show-ExportDialog {
         $includePlanned = [bool]$plannedCheckBox.IsChecked
         $script:ExportType = if ($includeCompleted -and $includePlanned) { 'both' } elseif ($includePlanned) { 'planned' } else { 'completed' }
         $exportHint.Text = if ($includeCompleted -and $includePlanned) {
-            '将导出两类内容：已完成事项按“完成日期”筛选，未来计划按“DDL 日期”筛选。上方起止日期同时用于这两种筛选，也可以留空。'
+            '将同时导出已完成和未完成事项。不选择时间时包含全部未完成事项；选择时间后，未完成事项按 DDL 筛选，没有 DDL 的事项不纳入该时间范围。'
         } elseif ($includePlanned) {
-            '按 DDL 导出尚未完成的计划；开始和结束日期均可留空。'
+            '不选择时间时导出全部未完成事项；选择时间后按 DDL 筛选，没有 DDL 的事项不纳入该时间范围。'
         } else {
             '按完成时间导出；开始和结束日期均可留空。'
         }
@@ -2358,14 +2360,19 @@ function Show-ExportDialog {
         if ($includePlanned) {
             $plannedTasks = @($script:Tasks | Where-Object {
                 -not $_.completed -and
-                -not [string]::IsNullOrWhiteSpace([string]$_.dueDate) -and
-                ($null -eq $startDate -or ([datetime]$_.dueDate).Date -ge $startDate) -and
-                ($null -eq $endDate -or ([datetime]$_.dueDate).Date -le $endDate)
-            } | Sort-Object { [datetime]$_.dueDate })
+                (
+                    (($null -eq $startDate -and $null -eq $endDate)) -or
+                    (
+                        -not [string]::IsNullOrWhiteSpace([string]$_.dueDate) -and
+                        ($null -eq $startDate -or ([datetime]$_.dueDate).Date -ge $startDate) -and
+                        ($null -eq $endDate -or ([datetime]$_.dueDate).Date -le $endDate)
+                    )
+                )
+            } | Sort-Object @{ Expression = { [string]::IsNullOrWhiteSpace([string]$_.dueDate) } }, @{ Expression = { if ([string]::IsNullOrWhiteSpace([string]$_.dueDate)) { [datetime]::MaxValue } else { [datetime]$_.dueDate } } })
         }
         $filteredTasks = @($completedTasks) + @($plannedTasks)
 
-        $typeLabel = if ($includeCompleted -and $includePlanned) { '已完成与未来计划' } elseif ($includeCompleted) { '已完成' } else { '未来计划' }
+        $typeLabel = if ($includeCompleted -and $includePlanned) { '已完成与未完成' } elseif ($includeCompleted) { '已完成' } else { '未完成' }
         $startLabel = if ($null -eq $startDate) { '最早记录' } else { $startDate.ToString('yyyy-MM-dd') }
         $endLabel = if ($null -eq $endDate) { '不限' } else { $endDate.ToString('yyyy-MM-dd') }
         $outputDirectory = Join-Path $PSScriptRoot 'output'
@@ -2836,6 +2843,7 @@ $newTaskText.Add_KeyDown({
 })
 $settingsButton.Add_Click({ Show-Settings })
 $exportButton.Add_Click({ Show-ExportDialog })
+$minimizeButton.Add_Click({ $window.WindowState = [Windows.WindowState]::Minimized })
 $closeButton.Add_Click({ $window.Close() })
 $lockButton.Add_Click({
     $script:IsLocked = -not $script:IsLocked
