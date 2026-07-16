@@ -19,12 +19,14 @@ $script:AppDirectory = Join-Path $env:LOCALAPPDATA 'DesktopTodoDemo'
 $script:StatePath = Join-Path $script:AppDirectory 'state.json'
 $script:LauncherPath = Join-Path $PSScriptRoot 'Start-Todo.vbs'
 $script:RestartLauncherPath = Join-Path $PSScriptRoot 'Restart-Todo.vbs'
+$script:UpdaterLauncherPath = Join-Path $PSScriptRoot 'Update-Todo.vbs'
 $script:IconPath = Join-Path $PSScriptRoot 'assets\todo-icon.ico'
 $script:DetailDirectory = Join-Path $PSScriptRoot 'detail'
 $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
-$script:Version = '1.4.0'
+$script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
+$script:Version = '1.5.0'
 
 trap {
     $details = ($_ | Out-String)
@@ -1211,6 +1213,33 @@ function Restart-TodoWidget {
     }
 }
 
+function Get-GitHubUpdateInfo {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $response = Invoke-WebRequest -Uri "$script:GitHubVersionUrl`?t=$cacheBuster" -UseBasicParsing -TimeoutSec 20 -Headers @{ 'User-Agent' = 'DesktopTodoWidget' }
+    $remoteVersionText = ([string]$response.Content).Trim()
+    if ($remoteVersionText -notmatch '^\d+\.\d+\.\d+$') { throw "GitHub 返回了无效版本号：$remoteVersionText" }
+    return [PSCustomObject]@{
+        CurrentVersion = [version]$script:Version
+        RemoteVersion = [version]$remoteVersionText
+        RemoteVersionText = $remoteVersionText
+    }
+}
+
+function Start-TodoSelfUpdate {
+    param([string]$ExpectedVersion)
+    if (-not (Test-Path -LiteralPath $script:UpdaterLauncherPath)) {
+        throw "找不到静默更新文件：$script:UpdaterLauncherPath"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Update-Todo.ps1'))) {
+        throw "找不到更新程序：$(Join-Path $PSScriptRoot 'Update-Todo.ps1')"
+    }
+    Save-State
+    $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+    Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}" "{1}"' -f $script:UpdaterLauncherPath, $ExpectedVersion) -WindowStyle Hidden
+    $window.Close()
+}
+
 function Initialize-TrayIcon {
     if ($null -ne $script:TrayIcon) { return }
 
@@ -1923,6 +1952,13 @@ function Show-Settings {
             <TextBlock Margin="0,20,0,8" Text="启动" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
             <CheckBox x:Name="AutoStartCheckBox" Content="开机自启动"/>
 
+            <TextBlock Margin="0,20,0,8" Text="软件更新" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
+            <StackPanel Orientation="Horizontal">
+                <Button x:Name="CheckUpdateButton" Content="检查更新" Width="104" Height="34" Background="#FFF0EEFC" Foreground="#FF6257C5"/>
+                <TextBlock x:Name="CurrentVersionText" Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#FF707580"/>
+            </StackPanel>
+            <TextBlock x:Name="UpdateStatusText" Margin="0,7,0,0" FontSize="11" Foreground="#FF707580" TextWrapping="Wrap"/>
+
             <TextBlock Margin="0,20,0,8" Text="OneDrive 手动同步" FontSize="16" FontWeight="SemiBold" Foreground="#FF20242C"/>
             <TextBlock Text="上传只写入本机设备快照；下载会读取云端快照并与本地合并，但不会自动回传。两种操作都会先完整备份本机数据。"
                        FontSize="11" Foreground="#FF707580" TextWrapping="Wrap" Margin="0,0,0,9"/>
@@ -1982,6 +2018,9 @@ function Show-Settings {
     $desktopLayerRadio = $settingsWindow.FindName('DesktopLayerRadio')
     $alwaysBottomRadio = $settingsWindow.FindName('AlwaysBottomRadio')
     $autoStartCheckBox = $settingsWindow.FindName('AutoStartCheckBox')
+    $checkUpdateButton = $settingsWindow.FindName('CheckUpdateButton')
+    $currentVersionText = $settingsWindow.FindName('CurrentVersionText')
+    $updateStatusText = $settingsWindow.FindName('UpdateStatusText')
     $syncDirectoryText = $settingsWindow.FindName('SyncDirectoryText')
     $browseSyncDirectoryButton = $settingsWindow.FindName('BrowseSyncDirectoryButton')
     $uploadSyncButton = $settingsWindow.FindName('UploadSyncButton')
@@ -2000,10 +2039,54 @@ function Show-Settings {
     $desktopLayerRadio.IsChecked = $script:WindowLayerMode -ne 'alwaysBottom'
     $alwaysBottomRadio.IsChecked = $script:WindowLayerMode -eq 'alwaysBottom'
     $autoStartCheckBox.IsChecked = $script:AutoStartEnabled
+    $currentVersionText.Text = "当前版本：v$script:Version"
     $syncDirectoryText.Text = if ([string]::IsNullOrWhiteSpace($script:SyncDirectory)) { [string](Get-DefaultSyncDirectory) } else { $script:SyncDirectory }
     $lastSyncText.Text = Get-LastSyncDisplayText
     $backupInfo = Get-BackupStorageInfo
     $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
+
+    $checkUpdateButton.Add_Click({
+        $checkUpdateButton.IsEnabled = $false
+        $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
+        $updateStatusText.Text = '正在连接 GitHub 检查版本…'
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $updateInfo = Get-GitHubUpdateInfo
+            if ($updateInfo.RemoteVersion -le $updateInfo.CurrentVersion) {
+                $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
+                $updateStatusText.Text = if ($updateInfo.RemoteVersion -eq $updateInfo.CurrentVersion) {
+                    "当前已是最新版本 v$script:Version。"
+                } else {
+                    "当前版本 v$script:Version 高于 GitHub 正式版 v$($updateInfo.RemoteVersionText)，无需更新。"
+                }
+                return
+            }
+
+            $answer = [Windows.MessageBox]::Show(
+                $settingsWindow,
+                "发现新版本 v$($updateInfo.RemoteVersionText)（当前 v$script:Version）。`n`n更新前会备份当前程序文件；待办、详细说明、备份和导出不会被覆盖。更新后程序将自动重启。是否继续？",
+                '发现软件更新',
+                [Windows.MessageBoxButton]::YesNo,
+                [Windows.MessageBoxImage]::Information
+            )
+            if ($answer -ne [Windows.MessageBoxResult]::Yes) {
+                $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF707580')
+                $updateStatusText.Text = '已取消更新。'
+                return
+            }
+
+            $updateStatusText.Text = '正在启动独立更新程序…'
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-TodoSelfUpdate $updateInfo.RemoteVersionText
+        }
+        catch {
+            $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
+            $updateStatusText.Text = "检查更新失败：$($_.Exception.Message)"
+        }
+        finally {
+            $checkUpdateButton.IsEnabled = $true
+        }
+    })
 
     $browseSyncDirectoryButton.Add_Click({
         $folderDialog = [System.Windows.Forms.FolderBrowserDialog]::new()
