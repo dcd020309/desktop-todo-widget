@@ -1,6 +1,7 @@
 ﻿param(
     [Parameter(Mandatory = $true)][string]$TargetDirectory,
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [int]$SourceProcessId = 0,
     [string]$ArchivePath,
     [switch]$SkipRestart,
     [switch]$Quiet
@@ -9,6 +10,7 @@
 $ErrorActionPreference = 'Stop'
 $repositoryArchiveUrl = 'https://github.com/dcd020309/desktop-todo-widget/archive/refs/heads/main.zip'
 $targetRoot = [IO.Path]::GetFullPath($TargetDirectory)
+$windowsDirectory = if ([string]::IsNullOrWhiteSpace($env:WINDIR)) { [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows) } else { $env:WINDIR }
 $appDataDirectory = Join-Path $env:LOCALAPPDATA 'DesktopTodoDemo'
 $logPath = Join-Path $appDataDirectory 'update.log'
 $temporaryRoot = Join-Path $env:TEMP ("DesktopTodoUpdate-{0}" -f [Guid]::NewGuid().ToString('N'))
@@ -59,8 +61,32 @@ function Copy-FileTree {
         if (-not (Test-Path -LiteralPath $destinationDirectory)) {
             New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
         }
-        Copy-Item -LiteralPath $sourceFile.FullName -Destination $destinationPath -Force
+        Copy-FileWithRetry $sourceFile.FullName $destinationPath
     }
+}
+
+function Copy-FileWithRetry {
+    param([string]$SourcePath, [string]$DestinationPath)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
+            return
+        }
+        catch {
+            $lastError = $_.Exception
+            if ($attempt -lt 20) { Start-Sleep -Milliseconds 250 }
+        }
+    }
+    throw "多次尝试后仍无法写入文件 $DestinationPath：$($lastError.Message)"
+}
+
+function Start-TodoApplication {
+    if ($SkipRestart) { return }
+    $launcherPath = Join-Path $targetRoot 'Start-Todo.vbs'
+    $wscriptPath = Join-Path $windowsDirectory 'System32\wscript.exe'
+    if (-not (Test-Path -LiteralPath $launcherPath)) { throw "找不到启动文件：$launcherPath" }
+    Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}"' -f $launcherPath) -WindowStyle Hidden
 }
 
 try {
@@ -68,15 +94,29 @@ try {
     $expected = [version]$ExpectedVersion
     if (-not (Test-Path -LiteralPath $targetRoot)) { throw "程序目录不存在：$targetRoot" }
 
-    # Wait for TodoWidget.ps1 to save state and release its single-instance mutex.
-    Start-Sleep -Milliseconds 1800
+    # Wait for TodoWidget.ps1 to save state and release icon/file handles.
+    if ($SourceProcessId -gt 0) {
+        $sourceProcess = Get-Process -Id $SourceProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $sourceProcess) {
+            Write-UpdateLog "正在等待旧程序进程 $SourceProcessId 完全退出。"
+            if (-not $sourceProcess.WaitForExit(15000)) { throw '旧程序未能在 15 秒内退出，已取消更新；请退出程序后重试。' }
+        }
+    }
+    else {
+        Start-Sleep -Milliseconds 1800
+    }
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
 
     if ([string]::IsNullOrWhiteSpace($ArchivePath)) {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         Write-UpdateLog "正在从 GitHub 下载更新包。"
-        Invoke-WebRequest -Uri $repositoryArchiveUrl -OutFile $downloadPath -UseBasicParsing -TimeoutSec 90 -Headers @{ 'User-Agent' = 'DesktopTodoUpdater' }
+        try {
+            Invoke-WebRequest -Uri $repositoryArchiveUrl -OutFile $downloadPath -UseBasicParsing -TimeoutSec 30 -DisableKeepAlive -Headers @{ 'User-Agent' = 'DesktopTodoUpdater' }
+        }
+        catch {
+            throw "无法从 GitHub 下载更新包，请检查网络或代理后重试。原始错误：$($_.Exception.Message)"
+        }
     }
     else {
         $resolvedArchive = [IO.Path]::GetFullPath($ArchivePath)
@@ -111,7 +151,7 @@ try {
         $backupFilePath = Join-Path $programBackupPath $relativePath
         $backupFileDirectory = [IO.Path]::GetDirectoryName($backupFilePath)
         if (-not (Test-Path -LiteralPath $backupFileDirectory)) { New-Item -ItemType Directory -Path $backupFileDirectory -Force | Out-Null }
-        Copy-Item -LiteralPath $currentFile.FullName -Destination $backupFilePath -Force
+        Copy-FileWithRetry $currentFile.FullName $backupFilePath
     }
     $currentVersionPath = Join-Path $targetRoot 'VERSION'
     $fromVersion = if (Test-Path -LiteralPath $currentVersionPath) { ([IO.File]::ReadAllText($currentVersionPath)).Trim() } else { $null }
@@ -131,11 +171,7 @@ try {
     if ([version]$installedVersion -ne $expected) { throw "安装后版本校验失败：$installedVersion" }
     Write-UpdateLog "更新完成，当前版本 $installedVersion。"
 
-    if (-not $SkipRestart) {
-        $launcherPath = Join-Path $targetRoot 'Start-Todo.vbs'
-        $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
-        Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}"' -f $launcherPath) -WindowStyle Hidden
-    }
+    Start-TodoApplication
 }
 catch {
     $message = $_.Exception.Message
@@ -153,6 +189,15 @@ catch {
         }
         catch {
             Write-UpdateLog "自动恢复失败：$($_.Exception.Message)"
+        }
+    }
+    if (-not $SkipRestart) {
+        try {
+            Start-TodoApplication
+            Write-UpdateLog '更新失败后已重新启动原程序。'
+        }
+        catch {
+            Write-UpdateLog "更新失败后无法重新启动原程序：$($_.Exception.Message)"
         }
     }
     if (-not $Quiet) { Show-UpdateError $message }
