@@ -27,7 +27,7 @@ $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
 $script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
-$script:Version = '1.5.3'
+$script:Version = '1.5.5'
 
 trap {
     $details = ($_ | Out-String)
@@ -1271,6 +1271,34 @@ function Get-InMemoryTrayIcon {
     }
 }
 
+function Get-TrayMenuLocation {
+    param(
+        [System.Drawing.Point]$CursorPosition,
+        [System.Drawing.Rectangle]$WorkingArea,
+        [System.Drawing.Size]$MenuSize
+    )
+    $margin = 10
+    $menuWidth = [Math]::Max(1, $MenuSize.Width)
+    $menuHeight = [Math]::Max(1, $MenuSize.Height)
+    $minimumLeft = $WorkingArea.Left + $margin
+    $maximumLeft = $WorkingArea.Right - $menuWidth - $margin
+    $minimumTop = $WorkingArea.Top + $margin
+    $maximumTop = $WorkingArea.Bottom - $menuHeight - $margin
+    $left = if ($maximumLeft -lt $minimumLeft) { $WorkingArea.Left } else { [Math]::Max($minimumLeft, [Math]::Min($CursorPosition.X - $menuWidth, $maximumLeft)) }
+    $top = if ($maximumTop -lt $minimumTop) { $WorkingArea.Top } else { [Math]::Max($minimumTop, [Math]::Min($CursorPosition.Y - $menuHeight - 14, $maximumTop)) }
+    return [System.Drawing.Point]::new($left, $top)
+}
+
+function Position-TrayContextMenu {
+    if ($null -eq $script:TrayMenu) { return }
+    $cursorPosition = [System.Windows.Forms.Cursor]::Position
+    $screen = [System.Windows.Forms.Screen]::FromPoint($cursorPosition)
+    if ($null -eq $screen) { return }
+    $menuSize = $script:TrayMenu.GetPreferredSize([System.Drawing.Size]::Empty)
+    $location = Get-TrayMenuLocation $cursorPosition $screen.WorkingArea $menuSize
+    $script:TrayMenu.Location = $location
+}
+
 function Initialize-TrayIcon {
     if ($null -ne $script:TrayIcon) { return }
 
@@ -1285,6 +1313,8 @@ function Initialize-TrayIcon {
     $settingsItem.Add_Click({ Show-Settings })
     $restartItem.Add_Click({ Restart-TodoWidget })
     $exitItem.Add_Click({ $window.Close() })
+    $script:TrayMenu.Add_Opening({ Position-TrayContextMenu })
+    $script:TrayMenu.Add_Opened({ Position-TrayContextMenu })
 
     $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
     if (Test-Path -LiteralPath $script:IconPath) {
