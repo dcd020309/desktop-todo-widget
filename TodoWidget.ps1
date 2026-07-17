@@ -3,6 +3,7 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Net.Http
 
 $ErrorActionPreference = 'Stop'
 
@@ -26,7 +27,7 @@ $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
 $script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
-$script:Version = '1.5.2'
+$script:Version = '1.5.3'
 
 trap {
     $details = ($_ | Out-String)
@@ -163,6 +164,7 @@ $script:BottomEnforcementTimer = $null
 $script:TrayIcon = $null
 $script:TrayMenu = $null
 $script:AppIcon = $null
+$script:UpdateCheckState = $null
 $script:IsRestoringUiState = $false
 $script:ExportType = 'completed'
 $script:ExportStartDate = $null
@@ -1213,11 +1215,9 @@ function Restart-TodoWidget {
     }
 }
 
-function Get-GitHubUpdateInfo {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $response = Invoke-WebRequest -Uri "$script:GitHubVersionUrl`?t=$cacheBuster" -UseBasicParsing -TimeoutSec 20 -Headers @{ 'User-Agent' = 'DesktopTodoWidget' }
-    $remoteVersionText = ([string]$response.Content).Trim()
+function ConvertTo-GitHubUpdateInfo {
+    param([string]$Content)
+    $remoteVersionText = $Content.Trim()
     if ($remoteVersionText -notmatch '^\d+\.\d+\.\d+$') { throw "GitHub 返回了无效版本号：$remoteVersionText" }
     return [PSCustomObject]@{
         CurrentVersion = [version]$script:Version
@@ -1236,8 +1236,39 @@ function Start-TodoSelfUpdate {
     }
     Save-State
     $wscriptPath = Join-Path $env:WINDIR 'System32\wscript.exe'
-    Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}" "{1}"' -f $script:UpdaterLauncherPath, $ExpectedVersion) -WindowStyle Hidden
+    Start-Process -FilePath $wscriptPath -ArgumentList ('"{0}" "{1}" "{2}"' -f $script:UpdaterLauncherPath, $ExpectedVersion, $PID) -WindowStyle Hidden
     $window.Close()
+}
+
+function Get-InMemoryWindowIcon {
+    param([string]$Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $icon = [Windows.Media.Imaging.BitmapFrame]::Create(
+            $stream,
+            [Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+            [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        )
+        if ($icon.CanFreeze) { $icon.Freeze() }
+        return $icon
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Get-InMemoryTrayIcon {
+    param([string]$Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $sourceIcon = $null
+    try {
+        $sourceIcon = [System.Drawing.Icon]::new($stream)
+        return [System.Drawing.Icon]$sourceIcon.Clone()
+    }
+    finally {
+        if ($null -ne $sourceIcon) { $sourceIcon.Dispose() }
+        $stream.Dispose()
+    }
 }
 
 function Initialize-TrayIcon {
@@ -1257,7 +1288,7 @@ function Initialize-TrayIcon {
 
     $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
     if (Test-Path -LiteralPath $script:IconPath) {
-        $script:AppIcon = [System.Drawing.Icon]::new($script:IconPath)
+        $script:AppIcon = Get-InMemoryTrayIcon $script:IconPath
         $script:TrayIcon.Icon = $script:AppIcon
     } else {
         $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Application
@@ -1561,7 +1592,7 @@ $window = [Windows.Markup.XamlReader]::Load($reader)
 Disable-ButtonFocusVisuals $window
 $window.Title = "桌面待办 v$script:Version"
 if (Test-Path -LiteralPath $script:IconPath) {
-    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($script:IconPath, [UriKind]::Absolute))
+    $window.Icon = Get-InMemoryWindowIcon $script:IconPath
 }
 
 $taskList = $window.FindName('TaskList')
@@ -2047,47 +2078,93 @@ function Show-Settings {
     $backupInfo = Get-BackupStorageInfo
     $backupStorageText.Text = "永久备份：$($backupInfo.BackupCount) 份，共 $($backupInfo.DisplaySize)。如占用过大，请手动清理 backup 文件夹。"
 
+    $script:UpdateCheckState = [PSCustomObject]@{
+        Timer = $null
+        Client = $null
+        Task = $null
+        Button = $checkUpdateButton
+        StatusText = $updateStatusText
+        Window = $settingsWindow
+    }
+    $settingsWindow.Add_Closed({
+        if ($null -ne $script:UpdateCheckState) {
+            if ($null -ne $script:UpdateCheckState.Timer) { $script:UpdateCheckState.Timer.Stop() }
+            if ($null -ne $script:UpdateCheckState.Client) { $script:UpdateCheckState.Client.Dispose() }
+            $script:UpdateCheckState = $null
+        }
+    })
+
     $checkUpdateButton.Add_Click({
-        $checkUpdateButton.IsEnabled = $false
-        $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
-        $updateStatusText.Text = '正在连接 GitHub 检查版本…'
-        [System.Windows.Forms.Application]::DoEvents()
-        try {
-            $updateInfo = Get-GitHubUpdateInfo
-            if ($updateInfo.RemoteVersion -le $updateInfo.CurrentVersion) {
-                $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
-                $updateStatusText.Text = if ($updateInfo.RemoteVersion -eq $updateInfo.CurrentVersion) {
-                    "当前已是最新版本 v$script:Version。"
-                } else {
-                    "当前版本 v$script:Version 高于 GitHub 正式版 v$($updateInfo.RemoteVersionText)，无需更新。"
+        $state = $script:UpdateCheckState
+        if ($null -eq $state) { return }
+        if ($null -ne $state.Task -and -not $state.Task.IsCompleted) { return }
+
+        $state.Button.IsEnabled = $false
+        $state.StatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
+        $state.StatusText.Text = '正在连接 GitHub 检查版本，窗口仍可正常操作…'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $client = [Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds(12)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd('DesktopTodoWidget')
+        $task = $client.GetStringAsync("$script:GitHubVersionUrl`?t=$cacheBuster")
+        $timer = [Windows.Threading.DispatcherTimer]::new()
+        $timer.Interval = [TimeSpan]::FromMilliseconds(120)
+        $state.Client = $client
+        $state.Task = $task
+        $state.Timer = $timer
+
+        $timer.Add_Tick({
+            $state = $script:UpdateCheckState
+            if ($null -eq $state -or $null -eq $state.Task) { return }
+            $task = $state.Task
+            if (-not $task.IsCompleted) { return }
+            $timer = $state.Timer
+            $client = $state.Client
+            $timer.Stop()
+            $state.Timer = $null
+            $state.Task = $null
+            $state.Client = $null
+            $state.Button.IsEnabled = $true
+            try {
+                if ($task.IsCanceled) { throw [TimeoutException]::new('连接 GitHub 超时，请检查网络或代理后重试。') }
+                if ($task.IsFaulted) { throw [Exception]::new($task.Exception.GetBaseException().Message) }
+                $updateInfo = ConvertTo-GitHubUpdateInfo ([string]$task.Result)
+                if ($updateInfo.RemoteVersion -le $updateInfo.CurrentVersion) {
+                    $state.StatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
+                    $state.StatusText.Text = if ($updateInfo.RemoteVersion -eq $updateInfo.CurrentVersion) {
+                        "当前已是最新版本 v$script:Version。"
+                    } else {
+                        "当前版本 v$script:Version 高于 GitHub 正式版 v$($updateInfo.RemoteVersionText)，无需更新。"
+                    }
+                    return
                 }
-                return
-            }
 
-            $answer = [Windows.MessageBox]::Show(
-                $settingsWindow,
-                "发现新版本 v$($updateInfo.RemoteVersionText)（当前 v$script:Version）。`n`n更新前会备份当前程序文件；待办、详细说明、备份和导出不会被覆盖。更新后程序将自动重启。是否继续？",
-                '发现软件更新',
-                [Windows.MessageBoxButton]::YesNo,
-                [Windows.MessageBoxImage]::Information
-            )
-            if ($answer -ne [Windows.MessageBoxResult]::Yes) {
-                $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF707580')
-                $updateStatusText.Text = '已取消更新。'
-                return
-            }
+                $answer = [Windows.MessageBox]::Show(
+                    $state.Window,
+                    "发现新版本 v$($updateInfo.RemoteVersionText)（当前 v$script:Version）。`n`n更新前会备份当前程序文件；待办、详细说明、备份和导出不会被覆盖。更新后程序将自动重启。是否继续？",
+                    '发现软件更新',
+                    [Windows.MessageBoxButton]::YesNo,
+                    [Windows.MessageBoxImage]::Information
+                )
+                if ($answer -ne [Windows.MessageBoxResult]::Yes) {
+                    $state.StatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF707580')
+                    $state.StatusText.Text = '已取消更新。'
+                    return
+                }
 
-            $updateStatusText.Text = '正在启动独立更新程序…'
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-TodoSelfUpdate $updateInfo.RemoteVersionText
-        }
-        catch {
-            $updateStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
-            $updateStatusText.Text = "检查更新失败：$($_.Exception.Message)"
-        }
-        finally {
-            $checkUpdateButton.IsEnabled = $true
-        }
+                $state.StatusText.Text = '正在启动独立更新程序…'
+                Start-TodoSelfUpdate $updateInfo.RemoteVersionText
+            }
+            catch {
+                $state.StatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE05252')
+                $state.StatusText.Text = "检查更新失败：$($_.Exception.Message)"
+            }
+            finally {
+                $client.Dispose()
+            }
+        })
+        $timer.Start()
     })
 
     $browseSyncDirectoryButton.Add_Click({
@@ -2118,7 +2195,7 @@ function Show-Settings {
         $downloadSyncButton.IsEnabled = $false
         $browseSyncDirectoryButton.IsEnabled = $false
         $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6C5CE7')
-        $syncStatusText.Text = if ($direction -eq 'upload') { '正在备份本机数据并上传设备快照…' } else { '正在备份本机数据并下载、合并云端快照…' }
+        $syncStatusText.Text = if ($direction -eq 'upload') { '正在备份本机数据并写入 OneDrive 同步文件夹…' } else { '正在备份本机数据并下载、合并云端快照…' }
         [System.Windows.Forms.Application]::DoEvents()
         try {
             $result = if ($direction -eq 'upload') { Invoke-OneDriveUpload $requestedSyncDirectory } else { Invoke-OneDriveDownload $requestedSyncDirectory }
@@ -2127,7 +2204,7 @@ function Show-Settings {
             $lastSyncText.Text = Get-LastSyncDisplayText
             $syncStatusText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF438563')
             if ($direction -eq 'upload') {
-                $syncStatusText.Text = "上传完成：已写入 $($result.TaskCount) 项待办和 $($result.DeletedTaskCount) 条删除记录。请等待 OneDrive 完成云端传输。"
+                $syncStatusText.Text = "本机写入成功：已将 $($result.TaskCount) 项待办和 $($result.DeletedTaskCount) 条删除记录写入 OneDrive 同步文件夹。云端传输由 OneDrive 客户端继续完成，可通过 OneDrive 状态图标确认。"
             } else {
                 $warningText = if ($result.InvalidSnapshotCount -gt 0) { "；跳过 $($result.InvalidSnapshotCount) 个无效快照" } else { '' }
                 $syncStatusText.Text = "下载完成：已合并 $($result.DeviceSnapshotCount) 个云端设备快照，当前共 $($result.TaskCount) 项待办$warningText。本次结果尚未上传。"
@@ -2761,7 +2838,6 @@ function Add-NewTask {
     }
     $script:Tasks = @($newTask) + @($script:Tasks)
     $newTaskText.Clear()
-    $script:CurrentFilter = 'all'
     Save-State
     Refresh-Tasks
     $newTaskText.Focus() | Out-Null
