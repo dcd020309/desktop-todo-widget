@@ -7,6 +7,9 @@ Set fileSystem = CreateObject("Scripting.FileSystemObject")
 projectDirectory = fileSystem.GetParentFolderName(WScript.ScriptFullName)
 scriptPath = fileSystem.BuildPath(projectDirectory, "TodoWidget.ps1")
 windowsDirectory = shell.ExpandEnvironmentStrings("%WINDIR%")
+If windowsDirectory = "%WINDIR%" Or Len(windowsDirectory) = 0 Then
+    windowsDirectory = fileSystem.GetSpecialFolder(0).Path
+End If
 powershellPath = fileSystem.BuildPath(windowsDirectory, "System32\WindowsPowerShell\v1.0\powershell.exe")
 
 If Not fileSystem.FileExists(scriptPath) Then

@@ -50,10 +50,19 @@ function Get-RelativePathFromRoot {
 }
 
 function Copy-FileTree {
-    param([string]$SourceRoot, [string]$DestinationRoot, [AllowNull()]$CreatedDestinations)
+    param(
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [AllowNull()]$CreatedDestinations,
+        [bool]$KeepExistingLockedIcon = $false
+    )
     foreach ($sourceFile in @(Get-ChildItem -LiteralPath $SourceRoot -Recurse -File -Force)) {
         $relativePath = Get-RelativePathFromRoot $SourceRoot $sourceFile.FullName
         $destinationPath = Join-Path $DestinationRoot $relativePath
+        if (Test-FilesEqual $sourceFile.FullName $destinationPath) {
+            Write-UpdateLog "文件内容未变化，跳过：$relativePath"
+            continue
+        }
         if ($null -ne $CreatedDestinations -and -not (Test-Path -LiteralPath $destinationPath)) {
             $CreatedDestinations.Add($destinationPath)
         }
@@ -61,7 +70,44 @@ function Copy-FileTree {
         if (-not (Test-Path -LiteralPath $destinationDirectory)) {
             New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
         }
-        Copy-FileWithRetry $sourceFile.FullName $destinationPath
+        try {
+            Copy-FileWithRetry $sourceFile.FullName $destinationPath
+        }
+        catch {
+            if ($KeepExistingLockedIcon -and $relativePath -ieq 'assets\todo-icon.ico' -and (Test-Path -LiteralPath $destinationPath)) {
+                Write-UpdateLog "图标文件仍被其他进程占用，保留现有图标并继续更新：$($_.Exception.Message)"
+                continue
+            }
+            throw
+        }
+    }
+}
+
+function Test-FilesEqual {
+    param([string]$FirstPath, [string]$SecondPath)
+    if (-not (Test-Path -LiteralPath $FirstPath -PathType Leaf) -or -not (Test-Path -LiteralPath $SecondPath -PathType Leaf)) { return $false }
+    $firstStream = $null
+    $secondStream = $null
+    $sha256 = $null
+    try {
+        $firstInfo = Get-Item -LiteralPath $FirstPath
+        $secondInfo = Get-Item -LiteralPath $SecondPath
+        if ($firstInfo.Length -ne $secondInfo.Length) { return $false }
+        $fileShare = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $firstStream = [IO.File]::Open($FirstPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $fileShare)
+        $secondStream = [IO.File]::Open($SecondPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $fileShare)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $firstHash = [Convert]::ToBase64String($sha256.ComputeHash($firstStream))
+        $secondHash = [Convert]::ToBase64String($sha256.ComputeHash($secondStream))
+        return $firstHash -eq $secondHash
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $sha256) { $sha256.Dispose() }
+        if ($null -ne $firstStream) { $firstStream.Dispose() }
+        if ($null -ne $secondStream) { $secondStream.Dispose() }
     }
 }
 
@@ -166,7 +212,7 @@ try {
     Write-UpdateLog "程序文件已备份到 $backupPath。"
 
     $copyStarted = $true
-    Copy-FileTree $sourceRoot $targetRoot $newDestinationFiles
+    Copy-FileTree $sourceRoot $targetRoot $newDestinationFiles $true
     $installedVersion = ([IO.File]::ReadAllText((Join-Path $targetRoot 'VERSION'), [Text.Encoding]::UTF8)).Trim()
     if ([version]$installedVersion -ne $expected) { throw "安装后版本校验失败：$installedVersion" }
     Write-UpdateLog "更新完成，当前版本 $installedVersion。"
