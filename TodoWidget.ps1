@@ -27,7 +27,7 @@ $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
 $script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
-$script:Version = '1.5.6'
+$script:Version = '1.5.7'
 
 trap {
     $details = ($_ | Out-String)
@@ -201,6 +201,14 @@ function Set-TaskModified {
     Set-ObjectProperty $Task 'updatedBy' $script:DeviceId
 }
 
+function Get-TaskDisplayText {
+    param($Task)
+    if ($null -eq $Task) { return '' }
+    $text = [string]$Task.text
+    if ([bool]$Task.canceled) { return "$text（已取消）" }
+    return $text
+}
+
 function Add-DeletionTombstone {
     param([string]$TaskId, [AllowNull()][string]$Timestamp)
     if ([string]::IsNullOrWhiteSpace($TaskId)) { return }
@@ -352,6 +360,7 @@ function New-TaskSyncRecord {
         id = [string]$Task.id
         text = [string]$Task.text
         completed = [bool]$Task.completed
+        canceled = [bool]$Task.canceled
         completedAt = if ([string]::IsNullOrWhiteSpace([string]$Task.completedAt)) { $null } else { [string]$Task.completedAt }
         dueDate = if ([string]::IsNullOrWhiteSpace([string]$Task.dueDate)) { $null } else { [string]$Task.dueDate }
         prerequisiteId = if ([string]::IsNullOrWhiteSpace([string]$Task.prerequisiteId)) { $null } else { [string]$Task.prerequisiteId }
@@ -384,6 +393,7 @@ function ConvertFrom-SyncTaskRecord {
         id = [string]$Record.id
         text = [string]$Record.text
         completed = [bool]$Record.completed
+        canceled = [bool]$Record.canceled
         completedAt = if ([string]::IsNullOrWhiteSpace([string]$Record.completedAt)) { $null } else { [string]$Record.completedAt }
         dueDate = if ([string]::IsNullOrWhiteSpace([string]$Record.dueDate)) { $null } else { [string]$Record.dueDate }
         prerequisiteId = if ([string]::IsNullOrWhiteSpace([string]$Record.prerequisiteId)) { $null } else { [string]$Record.prerequisiteId }
@@ -780,6 +790,19 @@ function Remove-TaskById {
     }
     $script:Tasks = @($script:Tasks | Where-Object { [string]$_.id -ne $TaskId })
     Add-DeletionTombstone $TaskId $deletionTimestamp
+    Save-State
+    Refresh-Tasks
+}
+
+function Cancel-TaskById {
+    param([string]$TaskId)
+    $task = Get-TaskById $TaskId
+    if ($null -eq $task -or [bool]$task.canceled) { return }
+    $timestamp = (Get-Date).ToString('o')
+    Set-ObjectProperty $task 'completed' $true
+    Set-ObjectProperty $task 'canceled' $true
+    Set-ObjectProperty $task 'completedAt' $timestamp
+    Set-TaskModified $task (Get-UtcTimestamp)
     Save-State
     Refresh-Tasks
 }
@@ -1337,8 +1360,8 @@ function Load-State {
     $defaultCreatedAt = Get-UtcTimestamp
     $defaultState = [PSCustomObject]@{
         tasks = @(
-            [PSCustomObject]@{ id = (New-TaskId); text = '体验桌面待办小组件'; completed = $false; completedAt = $null; dueDate = (Get-Date).AddDays(2).ToString('yyyy-MM-dd'); prerequisiteId = $null; sortOrder = 0; createdAt = $defaultCreatedAt; updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false },
-            [PSCustomObject]@{ id = (New-TaskId); text = '勾选一条已完成的任务'; completed = $true; completedAt = $defaultCreatedAt; dueDate = $null; prerequisiteId = $null; sortOrder = 1; createdAt = (Get-Date).AddMinutes(-1).ToString('o'); updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false }
+            [PSCustomObject]@{ id = (New-TaskId); text = '体验桌面待办小组件'; completed = $false; canceled = $false; completedAt = $null; dueDate = (Get-Date).AddDays(2).ToString('yyyy-MM-dd'); prerequisiteId = $null; sortOrder = 0; createdAt = $defaultCreatedAt; updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false },
+            [PSCustomObject]@{ id = (New-TaskId); text = '勾选一条已完成的任务'; completed = $true; canceled = $false; completedAt = $defaultCreatedAt; dueDate = $null; prerequisiteId = $null; sortOrder = 1; createdAt = (Get-Date).AddMinutes(-1).ToString('o'); updatedAt = $defaultCreatedAt; updatedBy = $defaultDeviceId; detailUpdatedAt = $null; detailUpdatedBy = $null; detailDeleted = $false }
         )
         deletedTasks = @()
         left = $null
@@ -1367,6 +1390,9 @@ function Load-State {
             if ($task.PSObject.Properties.Name -notcontains 'completedAt') {
                 $legacyCompletedAt = if ([bool]$task.completed) { [string]$task.createdAt } else { $null }
                 $task | Add-Member -NotePropertyName completedAt -NotePropertyValue $legacyCompletedAt
+            }
+            if ($task.PSObject.Properties.Name -notcontains 'canceled') {
+                $task | Add-Member -NotePropertyName canceled -NotePropertyValue $false
             }
             if ($task.PSObject.Properties.Name -notcontains 'prerequisiteId') {
                 $task | Add-Member -NotePropertyName prerequisiteId -NotePropertyValue $null
@@ -1675,10 +1701,10 @@ function Update-PrerequisitePicker {
         $item = [Windows.Controls.ComboBoxItem]::new()
         $item.Tag = [string]$task.id
         $prefix = if ($task.completed) { '✓ ' } else { '' }
-        $displayText = [string]$task.text
+        $displayText = Get-TaskDisplayText $task
         if ($displayText.Length -gt 15) { $displayText = $displayText.Substring(0, 15) + '…' }
         $item.Content = $prefix + $displayText
-        $item.ToolTip = [string]$task.text
+        $item.ToolTip = Get-TaskDisplayText $task
         [void]$prerequisiteComboBox.Items.Add($item)
         if ([string]$task.id -eq $selectedId) { $prerequisiteComboBox.SelectedItem = $item }
     }
@@ -1722,7 +1748,7 @@ function Show-PrerequisiteEditor {
     $editorWindow = [Windows.Markup.XamlReader]::Load($editorReader)
     Disable-ButtonFocusVisuals $editorWindow
     $editorWindow.Owner = $window
-    $editorWindow.FindName('TaskNameText').Text = "待办：$([string]$targetTask.text)"
+    $editorWindow.FindName('TaskNameText').Text = "待办：$(Get-TaskDisplayText $targetTask)"
     $editorComboBox = $editorWindow.FindName('EditorComboBox')
     $editorValidation = $editorWindow.FindName('EditorValidation')
     $saveEditorButton = $editorWindow.FindName('SaveEditorButton')
@@ -1740,7 +1766,7 @@ function Show-PrerequisiteEditor {
         $item = [Windows.Controls.ComboBoxItem]::new()
         $item.Tag = [string]$candidate.id
         $candidatePrefix = if ($candidate.completed) { '✓ ' } else { '' }
-        $item.Content = $candidatePrefix + [string]$candidate.text
+        $item.Content = $candidatePrefix + (Get-TaskDisplayText $candidate)
         [void]$editorComboBox.Items.Add($item)
         if ([string]$candidate.id -eq [string]$targetTask.prerequisiteId) { $editorComboBox.SelectedItem = $item }
     }
@@ -1876,7 +1902,7 @@ function Show-TaskActions {
     [xml]$actionsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="管理待办" Width="360" Height="392"
+        Title="管理待办" Width="360" Height="438"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
         WindowStyle="ToolWindow" ShowInTaskbar="False"
         Background="#FFF9FAFC" FontFamily="Microsoft YaHei UI">
@@ -1894,6 +1920,7 @@ function Show-TaskActions {
             <Button x:Name="EditPrerequisiteButton" Content="修改或取消前置任务" Height="36" Margin="0,0,0,10" Background="#FFECE9FF" Foreground="#FF5A49DA" BorderThickness="0"/>
             <Button x:Name="EditDetailButton" Content="编辑详细说明" Height="36" Margin="0,0,0,10" Background="#FFEDF4FF" Foreground="#FF376CA8" BorderThickness="0"/>
             <Button x:Name="DeleteDetailButton" Content="删除详细说明" Height="36" Margin="0,0,0,10" Background="#FFFFF3E8" Foreground="#FFB46B29" BorderThickness="0"/>
+            <Button x:Name="CancelTaskButton" Content="取消待办" Height="36" Margin="0,0,0,10" Background="#FFFFF2E4" Foreground="#FFB46B29" BorderThickness="0"/>
             <Button x:Name="DeleteTaskButton" Content="删除待办" Height="36" Background="#FFFFECEC" Foreground="#FFC94B4B" BorderThickness="0"/>
         </StackPanel>
         <Button x:Name="CloseActionsButton" Grid.Row="3" Content="关闭" Width="72" Height="30" Margin="0,14,0,0" HorizontalAlignment="Right"/>
@@ -1904,11 +1931,12 @@ function Show-TaskActions {
     $actionsWindow = [Windows.Markup.XamlReader]::Load($actionsReader)
     Disable-ButtonFocusVisuals $actionsWindow
     $actionsWindow.Owner = $window
-    $actionsWindow.FindName('ActionTaskName').Text = [string]$targetTask.text
+    $actionsWindow.FindName('ActionTaskName').Text = Get-TaskDisplayText $targetTask
     $editTaskTextButton = $actionsWindow.FindName('EditTaskTextButton')
     $editPrerequisiteButton = $actionsWindow.FindName('EditPrerequisiteButton')
     $editDetailButton = $actionsWindow.FindName('EditDetailButton')
     $deleteDetailButton = $actionsWindow.FindName('DeleteDetailButton')
+    $cancelTaskButton = $actionsWindow.FindName('CancelTaskButton')
     $deleteTaskButton = $actionsWindow.FindName('DeleteTaskButton')
     $closeActionsButton = $actionsWindow.FindName('CloseActionsButton')
     $existingDetailPath = Resolve-TaskDetailPath $TaskId
@@ -1916,6 +1944,11 @@ function Show-TaskActions {
     if (-not $deleteDetailButton.IsEnabled) {
         $deleteDetailButton.Content = '暂无详细说明可删除'
         $deleteDetailButton.Opacity = 0.58
+    }
+    if ([bool]$targetTask.canceled) {
+        $cancelTaskButton.IsEnabled = $false
+        $cancelTaskButton.Content = '待办已取消'
+        $cancelTaskButton.Opacity = 0.58
     }
 
     $editTaskTextButton.Add_Click({
@@ -1963,10 +1996,27 @@ function Show-TaskActions {
             )
         }
     })
+    $cancelTaskButton.Add_Click({
+        $currentTask = Get-TaskById $TaskId
+        if ($null -eq $currentTask) {
+            $actionsWindow.Close()
+            return
+        }
+        $answer = [Windows.MessageBox]::Show(
+            $actionsWindow,
+            "确定取消「$([string]$currentTask.text)」吗？`n`n取消后将作为已完成事项，并在名称后显示（已取消）。",
+            '取消待办',
+            [Windows.MessageBoxButton]::YesNo,
+            [Windows.MessageBoxImage]::Question
+        )
+        if ($answer -ne [Windows.MessageBoxResult]::Yes) { return }
+        Cancel-TaskById $TaskId
+        $actionsWindow.Close()
+    })
     $deleteTaskButton.Add_Click({
         $answer = [Windows.MessageBox]::Show(
             $actionsWindow,
-            "确定删除「$([string]$targetTask.text)」吗？",
+            "确定删除「$(Get-TaskDisplayText $targetTask)」吗？",
             '删除待办',
             [Windows.MessageBoxButton]::YesNo,
             [Windows.MessageBoxImage]::Warning
@@ -2503,11 +2553,11 @@ function Show-ExportDialog {
             $markdown.Add('| 待办事项 | 状态 | DDL | 前置任务 | 创建时间 | 完成时间 |')
             $markdown.Add('|---|---|---|---|---|---|')
             foreach ($task in $filteredTasks) {
-                $taskText = ConvertTo-MarkdownCell $task.text
-                $statusText = if ($task.completed) { '已完成' } elseif (Test-TaskBlocked $task) { '等待中' } else { '计划中' }
+                $taskText = ConvertTo-MarkdownCell (Get-TaskDisplayText $task)
+                $statusText = if ([bool]$task.canceled) { '已取消' } elseif ($task.completed) { '已完成' } elseif (Test-TaskBlocked $task) { '等待中' } else { '计划中' }
                 $dueText = if ([string]::IsNullOrWhiteSpace([string]$task.dueDate)) { '' } else { ([datetime]$task.dueDate).ToString('yyyy-MM-dd') }
                 $dependencyTask = Get-TaskById ([string]$task.prerequisiteId)
-                $dependencyText = if ($null -eq $dependencyTask) { '' } else { ConvertTo-MarkdownCell $dependencyTask.text }
+                $dependencyText = if ($null -eq $dependencyTask) { '' } else { ConvertTo-MarkdownCell (Get-TaskDisplayText $dependencyTask) }
                 $createdText = if ([string]::IsNullOrWhiteSpace([string]$task.createdAt)) { '' } else { ([datetime]$task.createdAt).ToString('yyyy-MM-dd HH:mm') }
                 $completedText = if ([string]::IsNullOrWhiteSpace([string]$task.completedAt)) { '' } else { ([datetime]$task.completedAt).ToString('yyyy-MM-dd HH:mm') }
                 $markdown.Add("| $taskText | $statusText | $dueText | $dependencyText | $createdText | $completedText |")
@@ -2625,7 +2675,7 @@ function Refresh-Tasks {
         [Windows.Controls.Grid]::SetColumn($check, 0)
 
         $label = [Windows.Controls.TextBlock]::new()
-        $label.Text = [string]$task.text
+        $label.Text = Get-TaskDisplayText $task
         $label.TextWrapping = 'Wrap'
         $label.VerticalAlignment = 'Center'
         $label.FontSize = 13
@@ -2678,13 +2728,13 @@ function Refresh-Tasks {
             $dependencyLabel.Margin = '0,4,0,0'
             $dependencyLabel.TextWrapping = 'Wrap'
             if ($isBlocked) {
-                $dependencyLabel.Text = "等待前置任务：$([string]$prerequisiteTask.text)"
+                $dependencyLabel.Text = "等待前置任务：$(Get-TaskDisplayText $prerequisiteTask)"
                 $dependencyLabel.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF777C85')
             } elseif ($task.completed) {
-                $dependencyLabel.Text = "前置任务：$([string]$prerequisiteTask.text)"
+                $dependencyLabel.Text = "前置任务：$(Get-TaskDisplayText $prerequisiteTask)"
                 $dependencyLabel.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFA1A5AE')
             } else {
-                $dependencyLabel.Text = "前置任务已完成：$([string]$prerequisiteTask.text)  ✓"
+                $dependencyLabel.Text = "前置任务已完成：$(Get-TaskDisplayText $prerequisiteTask)  ✓"
                 $dependencyLabel.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF6E9B80')
             }
             [void]$labelHost.Children.Add($dependencyLabel)
@@ -2778,6 +2828,7 @@ function Refresh-Tasks {
             $target = $script:Tasks | Where-Object { $_.id -eq $clickedTaskId } | Select-Object -First 1
             if ($null -ne $target) {
                 $target.completed = [bool]$sender.IsChecked
+                Set-ObjectProperty $target 'canceled' $false
                 $target.completedAt = if ($target.completed) { (Get-Date).ToString('o') } else { $null }
                 Set-TaskModified $target $null
             }
@@ -2858,6 +2909,7 @@ function Add-NewTask {
         id = (New-TaskId)
         text = $text
         completed = $false
+        canceled = $false
         completedAt = $null
         dueDate = if (-not [bool]$useDueDateCheckBox.IsChecked -or $null -eq $selectedDueDate) { $null } else { ([datetime]$selectedDueDate).ToString('yyyy-MM-dd') }
         prerequisiteId = $selectedPrerequisiteId
