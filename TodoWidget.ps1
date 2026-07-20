@@ -27,7 +27,7 @@ $script:BackupDirectory = Join-Path $PSScriptRoot 'backup'
 $script:AutoStartRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $script:AutoStartValueName = 'DesktopTodoWidget'
 $script:GitHubVersionUrl = 'https://raw.githubusercontent.com/dcd020309/desktop-todo-widget/main/VERSION'
-$script:Version = '1.5.5'
+$script:Version = '1.5.6'
 
 trap {
     $details = ($_ | Out-String)
@@ -35,15 +35,17 @@ trap {
         New-Item -ItemType Directory -Path $script:AppDirectory -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:AppDirectory 'error.log') -Value $details -Encoding UTF8
     } catch {}
-    try {
-        [void][Windows.MessageBox]::Show(
-            "桌面待办启动失败。`n`n$($_.Exception.Message)`n`n错误日志：$script:AppDirectory\error.log",
-            '桌面待办',
-            [Windows.MessageBoxButton]::OK,
-            [Windows.MessageBoxImage]::Error
-        )
-    } catch {
-        [Console]::Error.WriteLine($details)
+    if (-not $script:IsShuttingDown) {
+        try {
+            [void][Windows.MessageBox]::Show(
+                "桌面待办启动失败。`n`n$($_.Exception.Message)`n`n错误日志：$script:AppDirectory\error.log",
+                '桌面待办',
+                [Windows.MessageBoxButton]::OK,
+                [Windows.MessageBoxImage]::Error
+            )
+        } catch {
+            [Console]::Error.WriteLine($details)
+        }
     }
     exit 1
 }
@@ -165,6 +167,7 @@ $script:TrayIcon = $null
 $script:TrayMenu = $null
 $script:AppIcon = $null
 $script:UpdateCheckState = $null
+$script:IsShuttingDown = $false
 $script:IsRestoringUiState = $false
 $script:ExportType = 'completed'
 $script:ExportStartDate = $null
@@ -3069,29 +3072,36 @@ $window.Add_ContentRendered({
     Initialize-TrayIcon
 })
 $window.Add_Closing({
-    if ($null -ne $script:BottomEnforcementTimer) { $script:BottomEnforcementTimer.Stop() }
+    $script:IsShuttingDown = $true
+    try {
+        if ($null -ne $script:BottomEnforcementTimer) { $script:BottomEnforcementTimer.Stop() }
+    } catch {}
     try {
         Save-State
+    } catch {
+        try { Add-Content -LiteralPath (Join-Path $script:AppDirectory 'error.log') -Value ($_ | Out-String) -Encoding UTF8 } catch {}
     }
-    finally {
-        if ($null -ne $script:TrayIcon) {
+    if ($null -ne $script:TrayIcon) {
+        try {
             $script:TrayIcon.Visible = $false
             $script:TrayIcon.Dispose()
-            $script:TrayIcon = $null
-        }
-        if ($null -ne $script:AppIcon) {
-            $script:AppIcon.Dispose()
-            $script:AppIcon = $null
-        }
-        if ($null -ne $script:TrayMenu) {
-            $script:TrayMenu.Dispose()
-            $script:TrayMenu = $null
-        }
-        if ($null -ne $script:InstanceMutex) {
-            try { $script:InstanceMutex.ReleaseMutex() } catch {}
-            $script:InstanceMutex.Dispose()
-        }
+        } catch {}
+        $script:TrayIcon = $null
+    }
+    if ($null -ne $script:AppIcon) {
+        try { $script:AppIcon.Dispose() } catch {}
+        $script:AppIcon = $null
+    }
+    if ($null -ne $script:TrayMenu) {
+        try { $script:TrayMenu.Dispose() } catch {}
+        $script:TrayMenu = $null
+    }
+    if ($null -ne $script:InstanceMutex) {
+        try { $script:InstanceMutex.ReleaseMutex() } catch {}
+        try { $script:InstanceMutex.Dispose() } catch {}
+        $script:InstanceMutex = $null
     }
 })
 [void]$window.ShowDialog()
+exit 0
 
